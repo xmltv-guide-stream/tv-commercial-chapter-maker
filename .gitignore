@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+wheels/
+.installed.cfg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# chaptermaker runtime artifacts (generated next to media, not source)
+.chapterprofiles/
+*.chapters.xml
+*.chapters.txt
+
+# Media — never commit video files to the repo
+*.mkv
+*.mp4
+*.avi
+*.ts
+*.m2ts
+*.mpg
+*.mpeg
+*.vob
+*.wmv
+*.mov
