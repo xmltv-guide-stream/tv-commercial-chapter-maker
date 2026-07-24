@@ -40,6 +40,9 @@ def build_config(args) -> DetectConfig:
         black_margin=args.black_margin,
         quiet_margin=args.quiet_margin,
         mode=args.mode,
+        quiet_floor_trim=args.quiet_floor_trim,
+        blank_guard=args.blank_guard,
+        bright_margin=args.bright_margin,
         near_miss=args.near_miss,
         near_deep=args.near_deep,
         near_tol=args.near_tol,
@@ -101,19 +104,28 @@ def diagnose_file(path: Path, cache: ProfileCache, cfg: DetectConfig, args, root
         print(f"  sustained_floor={floor:.1f}  spread_to_median={spread:.1f} "
               f"(gate needs >= {_MIN_SPREAD_LUMA})")
         print(f"  black_thresh = {'OFF (no dark excursion)' if not np.isfinite(bt) else f'{bt:.1f}'}")
+        if prof.peak_thresh is not None:
+            print(f"  peak(blank-guard): darkest-peak floor={prof.peak_floor:.1f}  "
+                  f"peak_thresh={prof.peak_thresh:.1f} (a dark frame must peak <= this)")
+        elif cfg.blank_guard:
+            print("  peak(blank-guard): no peak data (legacy cache) — re-run with --reprofile to enable")
     else:
         print("\nLUMA: no video samples!")
 
     # --- audio ---
     R = sig.a_rms
     if sig.has_audio and R.size:
-        floor = _sustained_floor(R, sig.a_times, _FLOOR_SUSTAIN)
+        raw_floor = _sustained_floor(R, sig.a_times, _FLOOR_SUSTAIN)
+        floor = _sustained_floor(R, sig.a_times, _FLOOR_SUSTAIN, cfg.quiet_floor_trim)
         spread = float(np.median(R)) - floor
         qt = prof.quiet_thresh
         print(f"\nAUDIO RMS (dBFS)  samples={R.size}")
         print(f"  {stats(R)}")
-        print(f"  sustained_floor={floor:.1f}dB  spread_to_median={spread:.1f}dB "
-              f"(gate needs >= {_MIN_SPREAD_DB})")
+        trimnote = (f"  (raw min-floor {raw_floor:.1f}dB trimmed {cfg.quiet_floor_trim:.1%} "
+                    f"-> ignores silent-outro/digital-silence)" if cfg.quiet_floor_trim > 0
+                    and abs(floor - raw_floor) > 0.05 else "")
+        print(f"  quiet_floor={floor:.1f}dB  spread_to_median={spread:.1f}dB "
+              f"(gate needs >= {_MIN_SPREAD_DB}){trimnote}")
         print(f"  quiet_thresh = {'OFF (no quiet excursion)' if not np.isfinite(qt) else f'{qt:.1f}dB'}")
     else:
         print("\nAUDIO: none / not usable -> detection is video-only")
@@ -127,20 +139,30 @@ def diagnose_file(path: Path, cache: ProfileCache, cfg: DetectConfig, args, root
         rms_g = _resample(sig.a_times, sig.a_rms, grid)
     else:
         rms_g = np.full(grid.shape, np.nan)
+    peak_g = (_resample(sig.v_times, sig.v_peak, grid)
+              if getattr(sig, "v_peak", None) is not None and sig.v_peak.size else None)
+    # raw dark (mean only), to show what the blank guard is rejecting
+    raw_dark = (luma_g <= prof.black_thresh) if black_ok else np.zeros(grid.shape, bool)
     combined_mask, black_mask, quiet_mask = _combined_mask(
-        luma_g, rms_g, prof, cfg, black_ok, quiet_ok)
+        luma_g, rms_g, prof, cfg, black_ok, quiet_ok, peak_g)
     pct = lambda m: 100.0 * np.count_nonzero(m) / max(1, m.size)
     nm = ""
     if cfg.near_miss and cfg.mode == "and" and black_ok and quiet_ok:
         rescued = np.count_nonzero(combined_mask & ~(black_mask & quiet_mask))
         nm = f"  near-miss rescues={pct(combined_mask & ~(black_mask & quiet_mask)):.2f}%"
+    bg = ""
+    if peak_g is not None and prof.peak_thresh is not None:
+        blocked = np.count_nonzero(raw_dark & ~black_mask)
+        bg = f"  blank-guard rejects={pct(raw_dark & ~black_mask):.2f}% (dark-average but bright peak)"
     print(f"\nGRID (@{cfg.grid_step}s)  dark={pct(black_mask):.2f}%  quiet={pct(quiet_mask):.2f}%  "
           f"dark&quiet={pct(black_mask & quiet_mask):.2f}%  dark|quiet={pct(black_mask | quiet_mask):.2f}%"
-          f"  kept={pct(combined_mask):.2f}%{nm}")
+          f"  kept={pct(combined_mask):.2f}%{nm}{bg}")
 
     # --- the darkest moments, and what the audio is doing there ---
+    have_peak = peak_g is not None
+    pkhdr = f"  {'peak':>5}" if have_peak else ""
     print("\nDarkest moments (spaced >=2s apart):")
-    print(f"  {'time':>8}  {'luma':>6}  {'rms(dB)':>8}  dark? quiet? keep?")
+    print(f"  {'time':>8}  {'luma':>6}{pkhdr}  {'rms(dB)':>8}  dark? quiet? keep?")
     kept_t: list[float] = []
     for i in np.argsort(luma_g):
         t = float(grid[i])
@@ -151,9 +173,15 @@ def diagnose_file(path: Path, cache: ProfileCache, cfg: DetectConfig, args, root
         q = "yes" if quiet_ok and quiet_mask[i] else "no "
         k = "yes" if combined_mask[i] else "no "
         raw_and = black_mask[i] and quiet_mask[i]
-        flag = " <-near-miss" if (combined_mask[i] and not raw_and) else ""
+        if have_peak and raw_dark[i] and not black_mask[i]:
+            flag = " <-blank-guard (has content)"
+        elif combined_mask[i] and not raw_and:
+            flag = " <-near-miss"
+        else:
+            flag = ""
         rv = f"{rms_g[i]:.1f}" if quiet_ok else "n/a"
-        print(f"  {_fmt_clock(t):>8}  {luma_g[i]:6.1f}  {rv:>8}   {d}   {q}   {k}{flag}")
+        pk = f"  {peak_g[i]:5.1f}" if have_peak else ""
+        print(f"  {_fmt_clock(t):>8}  {luma_g[i]:6.1f}{pk}  {rv:>8}   {d}   {q}   {k}{flag}")
         if len(kept_t) >= 15:
             break
 
@@ -285,8 +313,14 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Global multiplier on how far from the file's floor still counts (higher = more breaks)")
     tune.add_argument("--black-margin", type=float, default=14.0,
                       help="Luma units above the file's darkest level still counted as 'black'")
+    tune.add_argument("--no-blank-guard", dest="blank_guard", action="store_false", default=True,
+                      help="Disable the blank guard: normally a frame must be dark at its brightest region too, so a scene on a black background (bright objects, dark background) isn't mistaken for a blank/fade frame")
+    tune.add_argument("--bright-margin", type=float, default=32.0,
+                      help="Blank guard: how far a frame's peak brightness may rise above the file's darkest-peak level and still count as 'blank' (lower = stricter about rejecting on-black content)")
     tune.add_argument("--quiet-margin", type=float, default=8.0,
                       help="dB above the file's quietest level still counted as 'silent'")
+    tune.add_argument("--quiet-floor-trim", type=float, default=0.01,
+                      help="Ignore this fraction of the quietest audio samples when setting the quiet floor, so a silent outro or a few digital-silence samples don't drag the threshold unrealistically low (0 = off; audio only)")
     tune.add_argument("--min-duration", type=float, default=0.30,
                       help="Minimum seconds a dark/quiet gap must last to count")
     tune.add_argument("--min-gap", "--min-spacing", dest="min_gap", type=float, default=45.0,

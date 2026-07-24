@@ -10,6 +10,14 @@ Tuning knobs (all exposed on the CLI):
   sensitivity     global multiplier on how far from the floor still counts
   black_margin    luma units above the file's black floor still counted "black"
   quiet_margin    dB above the file's quiet floor still counted "quiet"
+  quiet_floor_trim  fraction of the quietest audio samples ignored when setting
+                  the quiet floor (audio only), so a silent outro / a few
+                  digital-silence samples don't pin the threshold absurdly low
+  blank_guard     require a dark frame to be dark at its *peak* too, so a scene
+                  on a black background (low average, bright objects) is not
+                  mistaken for a blank/fade frame
+  bright_margin   how far a frame's peak may rise above the file's darkest-peak
+                  floor and still count as "blank"
   mode            'and'  -> a break needs BOTH dark and quiet (fewest false +)
                   'or'   -> either dark OR quiet
   near_miss       in 'and' mode, also accept a point where one signal is deep
@@ -36,6 +44,12 @@ class DetectConfig:
     sensitivity: float = 1.0
     black_margin: float = 14.0      # luma units (0..255)
     quiet_margin: float = 8.0       # dB
+    quiet_floor_trim: float = 0.01  # ignore this fraction of quietest audio
+                                    # samples when setting the floor, so a silent
+                                    # outro / digital-silence doesn't pin it low
+    blank_guard: bool = True        # a dark frame must ALSO be dark at its peak
+    bright_margin: float = 32.0     # how far a frame's peak may rise above the
+                                    # darkest-peak floor and still count "blank"
     mode: str = "and"               # 'and' | 'or'
     near_miss: bool = True          # in 'and' mode, rescue deep-one-signal + barely-missed-other
     near_deep: float = 0.5          # frac of band from floor that counts as "deep past floor"
@@ -77,6 +91,8 @@ class Profile:
     rms_floor: float
     quiet_thresh: float
     has_audio: bool
+    peak_floor: float = float("nan")     # file's darkest per-frame peak
+    peak_thresh: float | None = None     # peak at/below this = "blank" (None = guard off)
     extras: dict = field(default_factory=dict)
 
 
@@ -97,22 +113,32 @@ _MIN_SPREAD_LUMA = 8.0  # luma units (0..255)
 _MIN_SPREAD_DB = 5.0    # dB
 
 
-def _sustained_floor(values: np.ndarray, times: np.ndarray, sustain: float) -> float:
-    """The lowest level held for at least `sustain` seconds (robust near-min)."""
+def _sustained_floor(values: np.ndarray, times: np.ndarray, sustain: float,
+                     trim_frac: float = 0.0) -> float:
+    """The lowest level held for at least `sustain` seconds (robust near-min).
+
+    `trim_frac` discards that fraction of the most-extreme (lowest) samples
+    before taking the floor. Use it ONLY for audio: a silent outro or a few
+    digital-silence samples sit far below the content's real quiet level and,
+    left in, pin the floor (and the derived threshold) absurdly low. Luma must
+    NOT be trimmed — its darkest frames are the actual breaks we're hunting and
+    are often well under 1% of the file, so trimming would erase them."""
     n = values.size
     if n == 0:
         return float("nan")
     span = float(times[-1] - times[0]) if times.size > 1 else 1.0
     rate = n / span if span > 0 else n
-    k = max(1, min(int(round(sustain * rate)), n))
+    k_sustain = int(round(sustain * rate))
+    k_trim = int(round(trim_frac * n))
+    k = max(1, min(max(k_sustain, k_trim), n))
     return float(np.partition(values, k - 1)[k - 1])
 
 
-def _threshold(values, times, margin, sensitivity, min_spread):
+def _threshold(values, times, margin, sensitivity, min_spread, trim_frac=0.0):
     """Adaptive threshold anchored to the file's own floor, clamped so it can
     never reach the file's typical level (so flat content is never flagged).
     Returns -inf when the signal has no usable excursion."""
-    floor = _sustained_floor(values, times, _FLOOR_SUSTAIN)
+    floor = _sustained_floor(values, times, _FLOOR_SUSTAIN, trim_frac)
     typical = float(np.median(values))
     spread = typical - floor
     if spread < min_spread:
@@ -129,9 +155,21 @@ def build_profile(sig: Signals, cfg: DetectConfig) -> Profile:
 
     if sig.has_audio and sig.a_rms.size:
         rms_floor, quiet_thresh = _threshold(
-            sig.a_rms, sig.a_times, cfg.quiet_margin, cfg.sensitivity, _MIN_SPREAD_DB)
+            sig.a_rms, sig.a_times, cfg.quiet_margin, cfg.sensitivity, _MIN_SPREAD_DB,
+            cfg.quiet_floor_trim)
     else:
         rms_floor, quiet_thresh = float("nan"), float("nan")
+
+    # Peak (blank) guard: anchor to the file's *darkest* per-frame peak. During a
+    # real blank/fade the brightest region is dark too, so the peak dips to this
+    # floor; a scene on black keeps a bright peak and sits well above it. The
+    # threshold is a flat floor+margin (not clamped to a fraction of the spread
+    # like luma/audio) because we specifically want to allow the peak to rise a
+    # fixed amount above pure-black without letting real content through.
+    peak_floor, peak_thresh = float("nan"), None
+    if cfg.blank_guard and getattr(sig, "v_peak", None) is not None and sig.v_peak.size:
+        peak_floor = _sustained_floor(sig.v_peak, sig.v_times, _FLOOR_SUSTAIN)
+        peak_thresh = peak_floor + cfg.bright_margin * cfg.sensitivity
 
     return Profile(
         luma_floor=luma_floor,
@@ -139,6 +177,8 @@ def build_profile(sig: Signals, cfg: DetectConfig) -> Profile:
         rms_floor=rms_floor,
         quiet_thresh=quiet_thresh,
         has_audio=sig.has_audio,
+        peak_floor=peak_floor,
+        peak_thresh=peak_thresh,
         extras={
             "luma_median": float(np.median(sig.v_luma)) if sig.v_luma.size else None,
             "rms_median": float(np.median(sig.a_rms)) if sig.a_rms.size else None,
@@ -146,7 +186,7 @@ def build_profile(sig: Signals, cfg: DetectConfig) -> Profile:
     )
 
 
-def _combined_mask(luma_g, rms_g, prof, cfg, black_ok, quiet_ok):
+def _combined_mask(luma_g, rms_g, prof, cfg, black_ok, quiet_ok, peak_g=None):
     """Build the per-grid-point break mask, plus the raw dark/quiet masks.
 
     In 'and' mode with near-miss enabled, a point also qualifies when one signal
@@ -154,9 +194,16 @@ def _combined_mask(luma_g, rms_g, prof, cfg, black_ok, quiet_ok):
     This rescues real breaks that a hard AND drops on a hair — e.g. a fade that
     hits the file's quiet floor but bottoms out at dark-grey (luma just over the
     black line), which is exactly how interior fades look on many VHS rips.
+
+    Blank guard: when a per-frame peak signal is available, a frame is "dark"
+    only if its peak is also low — so a busy scene on a black background (low
+    average luma, bright objects) is not mistaken for a blank/fade frame.
     Returns (combined, black_mask, quiet_mask)."""
     shape = luma_g.shape
     black_mask = (luma_g <= prof.black_thresh) if black_ok else np.zeros(shape, bool)
+    if (black_ok and cfg.blank_guard and peak_g is not None
+            and prof.peak_thresh is not None and np.isfinite(prof.peak_thresh)):
+        black_mask = black_mask & (peak_g <= prof.peak_thresh)
     quiet_mask = (rms_g <= prof.quiet_thresh) if quiet_ok else np.zeros(shape, bool)
 
     if black_ok and quiet_ok:
@@ -204,9 +251,11 @@ def detect(sig: Signals, cfg: DetectConfig) -> tuple[list[Break], Profile]:
         rms_g = _resample(sig.a_times, sig.a_rms, grid)
     else:
         rms_g = np.full(grid.shape, np.nan)
+    peak_g = (_resample(sig.v_times, sig.v_peak, grid)
+              if getattr(sig, "v_peak", None) is not None and sig.v_peak.size else None)
 
     combined, black_mask, quiet_mask = _combined_mask(
-        luma_g, rms_g, prof, cfg, black_ok, quiet_ok)
+        luma_g, rms_g, prof, cfg, black_ok, quiet_ok, peak_g)
 
     breaks = _runs_to_breaks(grid, combined, luma_g, rms_g, cfg)
 

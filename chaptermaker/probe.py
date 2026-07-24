@@ -2,7 +2,10 @@
 
 We do two cheap passes:
 
-  * video luma  -> signalstats YAVG (average luma per sampled frame, 0..255)
+  * video luma  -> average luma per sampled frame, 0..255
+  * video peak  -> a high percentile of each frame's pixels, so a scene sitting
+                   on a black background (low average, but bright objects) can be
+                   told apart from a genuinely blank/fade frame (dark everywhere)
   * audio level -> astats RMS_level (dBFS per short window)
 
 The file is always passed as a normal ``-i`` argument (never embedded in a
@@ -57,9 +60,12 @@ class Signals:
     a_times: np.ndarray  # seconds
     a_rms: np.ndarray    # RMS level in dBFS (e.g. -90 = near silent, 0 = max)
     has_audio: bool
+    # per-frame high-percentile luma (brightest region). None for legacy caches
+    # profiled before this signal existed -> detection skips the blank guard.
+    v_peak: np.ndarray | None = None
 
     def as_dict(self) -> dict:
-        return {
+        d = {
             "duration": self.duration,
             "v_times": self.v_times.tolist(),
             "v_luma": self.v_luma.tolist(),
@@ -67,9 +73,13 @@ class Signals:
             "a_rms": self.a_rms.tolist(),
             "has_audio": self.has_audio,
         }
+        if self.v_peak is not None:
+            d["v_peak"] = self.v_peak.tolist()
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "Signals":
+        peak = d.get("v_peak")
         return cls(
             duration=d["duration"],
             v_times=np.asarray(d["v_times"], dtype=np.float64),
@@ -77,6 +87,7 @@ class Signals:
             a_times=np.asarray(d["a_times"], dtype=np.float64),
             a_rms=np.asarray(d["a_rms"], dtype=np.float64),
             has_audio=d["has_audio"],
+            v_peak=None if peak is None else np.asarray(peak, dtype=np.float64),
         )
 
 
@@ -146,8 +157,23 @@ def _finish(proc, produced: bool, what: str) -> None:
         raise RuntimeError(f"ffmpeg {what} decode failed (exit {ret}): {msg}")
 
 
-def _sample_video_luma(path: str, fps: float, scale_w: int, scale_h: int) -> tuple[np.ndarray, np.ndarray]:
-    """Return (times, luma 0..255) by averaging raw grayscale frames at `fps`."""
+# High percentile used for the per-frame "peak" (brightest region) signal.
+# We want to catch even a small, dim highlight in an otherwise-black frame (a
+# dark scene is not a blank), so this is very high — the top ~0.1% of pixels.
+# It works only because the peak is sampled at a fairly high resolution (see
+# probe_file's scale below): at a small size, area-averaging blends sparse
+# bright pixels into the surrounding black and no percentile can recover them.
+_PEAK_PCT = 99.9
+
+
+def _sample_video(path: str, fps: float, scale_w: int, scale_h: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return (times, luma, peak), each 0..255, from raw grayscale frames at `fps`.
+
+    luma = frame mean (scale-invariant, so cheap to compute at any size); peak =
+    the frame's high-percentile brightness. A blank frame is dark in both; a
+    scene on a black background — even a very dark one with only faint detail —
+    has a low mean but a peak that rises above the file's darkest frames, which
+    is how detection avoids marking dark-scene frames as breaks."""
     frame_bytes = scale_w * scale_h
     proc = _popen([
         "-i", path, "-map", "0:v:0", "-an", "-sn", "-dn",
@@ -155,14 +181,17 @@ def _sample_video_luma(path: str, fps: float, scale_w: int, scale_h: int) -> tup
         "-pix_fmt", "gray", "-f", "rawvideo", "-",
     ])
     luma: list[float] = []
+    peak: list[float] = []
     while True:
         buf = _read_exact(proc.stdout, frame_bytes)
         if len(buf) < frame_bytes:
             break  # clean EOF (ignore any partial trailing frame)
-        luma.append(float(np.frombuffer(buf, dtype=np.uint8).mean()))
+        px = np.frombuffer(buf, dtype=np.uint8)
+        luma.append(float(px.mean()))
+        peak.append(float(np.percentile(px, _PEAK_PCT)))
     _finish(proc, produced=bool(luma), what="video")
     times = np.arange(len(luma), dtype=np.float64) / fps
-    return times, np.asarray(luma, dtype=np.float64)
+    return times, np.asarray(luma, dtype=np.float64), np.asarray(peak, dtype=np.float64)
 
 
 def _sample_audio_rms(path: str, window: float, sr: int = 8000) -> tuple[np.ndarray, np.ndarray]:
@@ -195,12 +224,12 @@ def probe_file(
     *,
     video_fps: float = 12.0,
     audio_window: float = 0.1,
-    scale_w: int = 128,
-    scale_h: int = 72,
+    scale_w: int = 256,
+    scale_h: int = 144,
 ) -> Signals:
     """Profile one file into brightness and loudness time series."""
     duration = probe_duration(path)
-    v_times, v_luma = _sample_video_luma(path, video_fps, scale_w, scale_h)
+    v_times, v_luma, v_peak = _sample_video(path, video_fps, scale_w, scale_h)
     has_audio = _has_audio_stream(path)
     if has_audio:
         a_times, a_rms = _sample_audio_rms(path, audio_window)
@@ -211,4 +240,5 @@ def probe_file(
         v_times=v_times, v_luma=v_luma,
         a_times=a_times, a_rms=a_rms,
         has_audio=has_audio,
+        v_peak=v_peak,
     )

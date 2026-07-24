@@ -21,6 +21,14 @@ from .probe import Signals
 
 CACHE_DIRNAME = ".chapterprofiles"
 
+# Bump whenever the *meaning* of a cached signal changes (sampling resolution,
+# a new/redefined array, etc.) so stale-format entries are transparently
+# recomputed instead of silently mixing old numbers with new detection logic.
+#   1: original luma+audio
+#   2: added per-frame peak (95th @128x72)
+#   3: peak now 99.9th @256x144 so faint highlights survive downscale
+SIGNALS_VERSION = 3
+
 
 def _key(path: str) -> str:
     st = os.stat(path)
@@ -51,6 +59,8 @@ class ProfileCache:
         try:
             with gzip.open(p, "rt", encoding="utf-8") as fh:
                 data = json.load(fh)
+            if data.get("version") != SIGNALS_VERSION:
+                return None  # stale format -> recompute with current sampling
             return Signals.from_dict(data["signals"])
         except (OSError, KeyError, ValueError):
             return None  # corrupt/partial cache -> just recompute
@@ -58,7 +68,8 @@ class ProfileCache:
     def put(self, path: str, signals: Signals) -> None:
         p = self._entry_path(path)
         tmp = p.with_suffix(".tmp")
-        payload = {"source": os.path.abspath(path), "signals": signals.as_dict()}
+        payload = {"version": SIGNALS_VERSION,
+                   "source": os.path.abspath(path), "signals": signals.as_dict()}
         # Write to a temp file then rename so an interrupted write never leaves
         # a half-valid cache entry. A cache failure is non-fatal — the profile
         # was already computed for this run; we just lose the speedup next time.
