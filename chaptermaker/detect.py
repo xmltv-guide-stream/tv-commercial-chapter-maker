@@ -12,6 +12,10 @@ Tuning knobs (all exposed on the CLI):
   quiet_margin    dB above the file's quiet floor still counted "quiet"
   mode            'and'  -> a break needs BOTH dark and quiet (fewest false +)
                   'or'   -> either dark OR quiet
+  near_miss       in 'and' mode, also accept a point where one signal is deep
+                  past its floor and the other only *just* misses its threshold
+                  (rescues fades that hit true-quiet but not-quite-black, or
+                  vice-versa — common on VHS where interior fades stop at grey)
   min_duration    a candidate must persist at least this long (seconds)
   min_gap         drop a break if the last kept chapter was <this ago (seconds)
   skip_start      never place a detected break before this time (seconds)
@@ -33,6 +37,9 @@ class DetectConfig:
     black_margin: float = 14.0      # luma units (0..255)
     quiet_margin: float = 8.0       # dB
     mode: str = "and"               # 'and' | 'or'
+    near_miss: bool = True          # in 'and' mode, rescue deep-one-signal + barely-missed-other
+    near_deep: float = 0.5          # frac of band from floor that counts as "deep past floor"
+    near_tol: float = 0.25          # frac of band past threshold still counted as "nearly met"
     ignore_audio: bool = False      # detect on darkness alone (video-only)
     audio_fallback: bool = True     # if AND+audio finds too few, retry video-only
     min_duration: float = 0.30      # seconds a break must last
@@ -139,6 +146,41 @@ def build_profile(sig: Signals, cfg: DetectConfig) -> Profile:
     )
 
 
+def _combined_mask(luma_g, rms_g, prof, cfg, black_ok, quiet_ok):
+    """Build the per-grid-point break mask, plus the raw dark/quiet masks.
+
+    In 'and' mode with near-miss enabled, a point also qualifies when one signal
+    is *deep* past its own floor while the other only just misses its threshold.
+    This rescues real breaks that a hard AND drops on a hair — e.g. a fade that
+    hits the file's quiet floor but bottoms out at dark-grey (luma just over the
+    black line), which is exactly how interior fades look on many VHS rips.
+    Returns (combined, black_mask, quiet_mask)."""
+    shape = luma_g.shape
+    black_mask = (luma_g <= prof.black_thresh) if black_ok else np.zeros(shape, bool)
+    quiet_mask = (rms_g <= prof.quiet_thresh) if quiet_ok else np.zeros(shape, bool)
+
+    if black_ok and quiet_ok:
+        if cfg.mode == "and":
+            combined = black_mask & quiet_mask
+            if cfg.near_miss:
+                band_l = prof.black_thresh - prof.luma_floor
+                band_a = prof.quiet_thresh - prof.rms_floor
+                very_dark = luma_g <= prof.luma_floor + cfg.near_deep * band_l
+                very_quiet = rms_g <= prof.rms_floor + cfg.near_deep * band_a
+                nearly_dark = luma_g <= prof.black_thresh + cfg.near_tol * band_l
+                nearly_quiet = rms_g <= prof.quiet_thresh + cfg.near_tol * band_a
+                combined = combined | (very_dark & nearly_quiet) | (very_quiet & nearly_dark)
+        else:
+            combined = black_mask | quiet_mask
+    elif black_ok:
+        combined = black_mask
+    elif quiet_ok:
+        combined = quiet_mask
+    else:
+        combined = np.zeros(shape, bool)
+    return combined, black_mask, quiet_mask
+
+
 def detect(sig: Signals, cfg: DetectConfig) -> tuple[list[Break], Profile]:
     prof = build_profile(sig, cfg)
     duration = sig.duration or (float(sig.v_times[-1]) if sig.v_times.size else 0.0)
@@ -158,23 +200,13 @@ def detect(sig: Signals, cfg: DetectConfig) -> tuple[list[Break], Profile]:
                 and sig.a_rms.size > 0 and np.isfinite(prof.quiet_thresh))
 
     luma_g = _resample(sig.v_times, sig.v_luma, grid)
-    black_mask = (luma_g <= prof.black_thresh) if black_ok else np.zeros(grid.shape, dtype=bool)
-
     if quiet_ok:
         rms_g = _resample(sig.a_times, sig.a_rms, grid)
-        quiet_mask = rms_g <= prof.quiet_thresh
     else:
         rms_g = np.full(grid.shape, np.nan)
-        quiet_mask = np.zeros(grid.shape, dtype=bool)
 
-    if black_ok and quiet_ok:
-        combined = (black_mask & quiet_mask) if cfg.mode == "and" else (black_mask | quiet_mask)
-    elif black_ok:
-        combined = black_mask
-    elif quiet_ok:
-        combined = quiet_mask
-    else:
-        combined = np.zeros(grid.shape, dtype=bool)
+    combined, black_mask, quiet_mask = _combined_mask(
+        luma_g, rms_g, prof, cfg, black_ok, quiet_ok)
 
     breaks = _runs_to_breaks(grid, combined, luma_g, rms_g, cfg)
 
