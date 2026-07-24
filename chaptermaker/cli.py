@@ -231,8 +231,13 @@ def process_file(path: Path, cache: ProfileCache, cfg: DetectConfig, args, root:
 
     # 4. Optionally embed ----------------------------------------------------
     if args.embed and path.suffix.lower() == ".mkv":
+        prior_entry = cache.entry_path(str(path))  # keyed on the pre-embed stat
         try:
             embed_chapters(str(path), paths["xml"])
+            # Embedding rewrites the MKV -> mtime/size change would invalidate the
+            # cache key. Re-store the (unchanged) signals under the new stat so
+            # re-runs stay warm instead of re-decoding every embedded file.
+            cache.reput(str(path), sig, prior_entry)
             if args.verbose:
                 print("    embedded chapters into MKV")
         except MkvpropeditNotFound as e:
@@ -290,7 +295,7 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Suppress detected breaks before this time, e.g. 300 = no chapters in the first 5 min (the 00:00 marker is unaffected; use --no-intro to drop it too)")
     tune.add_argument("--skip-end", "--no-chapters-after-before-end", dest="skip_end", type=float, default=0.0,
                       help="Suppress detected breaks within this many seconds of the end (e.g. skip end credits)")
-    tune.add_argument("--mark-at", choices=["start", "mid", "end"], default="start",
+    tune.add_argument("--mark-at", choices=["start", "mid", "end"], default="mid",
                       help="Place the marker at the start/middle/end of the dark-quiet gap")
     tune.add_argument("--max-chapters", type=int, default=None,
                       help="Cap the number of chapters (keeps strongest)")

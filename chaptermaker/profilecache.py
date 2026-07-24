@@ -40,6 +40,10 @@ class ProfileCache:
     def _entry_path(self, path: str) -> Path:
         return self.dir / f"{_key(path)}.json.gz"
 
+    def entry_path(self, path: str) -> Path:
+        """Public accessor for a file's cache entry path (keyed on current stat)."""
+        return self._entry_path(path)
+
     def get(self, path: str) -> Signals | None:
         p = self._entry_path(path)
         if not p.exists():
@@ -64,6 +68,20 @@ class ProfileCache:
             tmp.replace(p)
         except OSError as e:
             print(f"  ! could not cache profile: {e}")
+
+    def reput(self, path: str, signals: Signals, prior_entry: Path | None = None) -> None:
+        """Re-store signals under the file's *current* stat, dropping a now-stale
+        prior entry. Used after embedding chapters rewrites the MKV in place
+        (changing its mtime/size) — without this the key would miss on the next
+        run and force a needless re-decode of an already-processed file."""
+        self.put(path, signals)
+        if prior_entry is not None:
+            current = self._entry_path(path)
+            if prior_entry != current and prior_entry.exists():
+                try:
+                    prior_entry.unlink()
+                except OSError:
+                    pass
 
     def clear(self) -> int:
         n = 0
