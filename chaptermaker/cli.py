@@ -13,8 +13,9 @@ from . import __version__
 from .chapters import (MkvpropeditNotFound, embed_chapters, to_ogm,
                        write_sidecars)
 from .detect import (Break, DetectConfig, _FLOOR_SUSTAIN, _MIN_SPREAD_DB,
-                     _MIN_SPREAD_LUMA, _resample, _sustained_floor,
-                     build_profile, count_breaks, detect_to_target)
+                     _MIN_SPREAD_LUMA, _combined_mask, _resample,
+                     _sustained_floor, build_profile, count_breaks,
+                     detect_to_target)
 from .probe import FfmpegNotFound, probe_file
 from .profilecache import ProfileCache
 
@@ -39,6 +40,9 @@ def build_config(args) -> DetectConfig:
         black_margin=args.black_margin,
         quiet_margin=args.quiet_margin,
         mode=args.mode,
+        near_miss=args.near_miss,
+        near_deep=args.near_deep,
+        near_tol=args.near_tol,
         ignore_audio=args.ignore_audio,
         audio_fallback=args.audio_fallback,
         min_duration=args.min_duration,
@@ -119,20 +123,24 @@ def diagnose_file(path: Path, cache: ProfileCache, cfg: DetectConfig, args, root
     luma_g = _resample(sig.v_times, sig.v_luma, grid)
     black_ok = np.isfinite(prof.black_thresh)
     quiet_ok = sig.has_audio and R.size > 0 and np.isfinite(prof.quiet_thresh)
-    black_mask = (luma_g <= prof.black_thresh) if black_ok else np.zeros(grid.shape, bool)
     if quiet_ok:
         rms_g = _resample(sig.a_times, sig.a_rms, grid)
-        quiet_mask = rms_g <= prof.quiet_thresh
     else:
         rms_g = np.full(grid.shape, np.nan)
-        quiet_mask = np.zeros(grid.shape, bool)
+    combined_mask, black_mask, quiet_mask = _combined_mask(
+        luma_g, rms_g, prof, cfg, black_ok, quiet_ok)
     pct = lambda m: 100.0 * np.count_nonzero(m) / max(1, m.size)
+    nm = ""
+    if cfg.near_miss and cfg.mode == "and" and black_ok and quiet_ok:
+        rescued = np.count_nonzero(combined_mask & ~(black_mask & quiet_mask))
+        nm = f"  near-miss rescues={pct(combined_mask & ~(black_mask & quiet_mask)):.2f}%"
     print(f"\nGRID (@{cfg.grid_step}s)  dark={pct(black_mask):.2f}%  quiet={pct(quiet_mask):.2f}%  "
-          f"dark&quiet={pct(black_mask & quiet_mask):.2f}%  dark|quiet={pct(black_mask | quiet_mask):.2f}%")
+          f"dark&quiet={pct(black_mask & quiet_mask):.2f}%  dark|quiet={pct(black_mask | quiet_mask):.2f}%"
+          f"  kept={pct(combined_mask):.2f}%{nm}")
 
     # --- the darkest moments, and what the audio is doing there ---
     print("\nDarkest moments (spaced >=2s apart):")
-    print(f"  {'time':>8}  {'luma':>6}  {'rms(dB)':>8}  dark? quiet?")
+    print(f"  {'time':>8}  {'luma':>6}  {'rms(dB)':>8}  dark? quiet? keep?")
     kept_t: list[float] = []
     for i in np.argsort(luma_g):
         t = float(grid[i])
@@ -141,8 +149,11 @@ def diagnose_file(path: Path, cache: ProfileCache, cfg: DetectConfig, args, root
         kept_t.append(t)
         d = "yes" if black_mask[i] else "no "
         q = "yes" if quiet_ok and quiet_mask[i] else "no "
+        k = "yes" if combined_mask[i] else "no "
+        raw_and = black_mask[i] and quiet_mask[i]
+        flag = " <-near-miss" if (combined_mask[i] and not raw_and) else ""
         rv = f"{rms_g[i]:.1f}" if quiet_ok else "n/a"
-        print(f"  {_fmt_clock(t):>8}  {luma_g[i]:6.1f}  {rv:>8}   {d}   {q}")
+        print(f"  {_fmt_clock(t):>8}  {luma_g[i]:6.1f}  {rv:>8}   {d}   {q}   {k}{flag}")
         if len(kept_t) >= 15:
             break
 
@@ -255,6 +266,12 @@ def build_parser() -> argparse.ArgumentParser:
     tune = p.add_argument_group("detection tuning")
     tune.add_argument("--mode", choices=["and", "or"], default="and",
                       help="'and' = dark AND quiet; 'or' = dark OR quiet")
+    tune.add_argument("--no-near-miss", dest="near_miss", action="store_false", default=True,
+                      help="Disable near-miss rescue: normally, in 'and' mode, a point where one signal is deep past its floor and the other only just misses its threshold still counts (catches fades that hit true-quiet but only dark-grey, or vice-versa)")
+    tune.add_argument("--near-deep", type=float, default=0.5,
+                      help="Near-miss: fraction of a signal's floor-to-threshold band, measured from the floor, that counts as 'deep past floor' (lower = stricter)")
+    tune.add_argument("--near-tol", type=float, default=0.25,
+                      help="Near-miss: fraction of the band past the threshold the other signal may sit and still count as 'nearly met' (higher = more forgiving)")
     tune.add_argument("--ignore-audio", action="store_true",
                       help="Detect on darkness alone (video-only). Best when audio is an unreliable break signal — common on VHS/DVR fade-to-black transitions")
     tune.add_argument("--no-audio-fallback", dest="audio_fallback", action="store_false",
