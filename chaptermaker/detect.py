@@ -48,7 +48,7 @@ class DetectConfig:
     skip_end: float = 0.0           # suppress detected breaks within this of the end
     grid_step: float = 0.10         # resampling resolution (seconds)
     add_intro: bool = True          # always put a chapter at 00:00
-    mark_at: str = "start"          # 'start' | 'mid' | 'end' of the dark/quiet run
+    mark_at: str = "mid"            # 'start' | 'mid' | 'end' of the dark/quiet run
     # --- auto-escalation to reach a minimum chapter count ---
     min_chapters: int = 0           # 0 = off; else loosen thresholds until met
     min_duration_floor: float = 0.05  # shortest gap escalation will accept (sec)
