@@ -256,6 +256,9 @@ def detect_to_target(sig: Signals, cfg: DetectConfig):
       3. Escalation — if a --min-chapters target is still unmet, loosen the
          thresholds (raise sensitivity) and shorten the minimum break duration
          toward min_duration_floor, retrying until met or attempts run out.
+         If audio was the limiter (AND-mode, usable audio, but the video has a
+         real dark excursion), escalation runs *video-only* — otherwise it would
+         just crank sensitivity while still demanding a silence that never comes.
 
     Returns (breaks, profile, trace). Each trace entry is a dict with a "kind"
     of "fallback" or "escalate".
@@ -280,6 +283,19 @@ def detect_to_target(sig: Signals, cfg: DetectConfig):
     # --- step 3: --min-chapters escalation --------------------------------
     if cfg.min_chapters <= 0 or count_breaks(breaks) >= cfg.min_chapters:
         return breaks, prof, trace
+
+    # If audio was the limiter — AND-mode with usable audio that still left us
+    # short, while the video *does* have a real dark excursion — escalate
+    # video-only. Cranking sensitivity while still requiring a silence that never
+    # comes (music over the fades, or a digital-silent outro that pins the quiet
+    # floor absurdly low) just spins uselessly to the attempt cap.
+    if (not work.ignore_audio and cfg.mode == "and"
+            and audio_was_used and np.isfinite(prof.black_thresh)):
+        work = replace(work, ignore_audio=True)
+        breaks, prof = detect(sig, work)
+        trace.append({"kind": "fallback", "found": count_breaks(breaks)})
+        if count_breaks(breaks) >= cfg.min_chapters:
+            return breaks, prof, trace
 
     for attempt in range(1, cfg.escalate_attempts + 1):
         work = replace(
