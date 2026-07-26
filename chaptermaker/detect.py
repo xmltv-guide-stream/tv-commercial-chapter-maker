@@ -18,6 +18,9 @@ Tuning knobs (all exposed on the CLI):
                   mistaken for a blank/fade frame
   bright_margin   how far a frame's peak may rise above the file's darkest-peak
                   floor and still count as "blank"
+  peak_cap        absolute peak ceiling; a frame brighter than this at its peak
+                  is never "blank", so a file that never truly goes dark yields
+                  no dark breaks rather than marking its dimmest scenes
   mode            'and'  -> a break needs BOTH dark and quiet (fewest false +)
                   'or'   -> either dark OR quiet
   near_miss       in 'and' mode, also accept a point where one signal is deep
@@ -50,6 +53,11 @@ class DetectConfig:
     blank_guard: bool = True        # a dark frame must ALSO be dark at its peak
     bright_margin: float = 32.0     # how far a frame's peak may rise above the
                                     # darkest-peak floor and still count "blank"
+    peak_cap: float = 100.0         # absolute ceiling: a frame whose peak exceeds
+                                    # this has real bright content and is NEVER
+                                    # blank, whatever the adaptive floor says — so
+                                    # a file with no true-dark frames yields no
+                                    # dark breaks instead of marking dim scenes
     mode: str = "and"               # 'and' | 'or'
     near_miss: bool = True          # in 'and' mode, rescue deep-one-signal + barely-missed-other
     near_deep: float = 0.5          # frac of band from floor that counts as "deep past floor"
@@ -169,7 +177,12 @@ def build_profile(sig: Signals, cfg: DetectConfig) -> Profile:
     peak_floor, peak_thresh = float("nan"), None
     if cfg.blank_guard and getattr(sig, "v_peak", None) is not None and sig.v_peak.size:
         peak_floor = _sustained_floor(sig.v_peak, sig.v_times, _FLOOR_SUSTAIN)
-        peak_thresh = peak_floor + cfg.bright_margin * cfg.sensitivity
+        # Clamp to an absolute ceiling: the adaptive part alone would drift up on
+        # a file with no true-dark frames (high darkest-peak floor) — and inflate
+        # under --min-chapters escalation — until bright scenes slip through. The
+        # cap means a frame with a genuinely bright region is never "blank", and
+        # if even the darkest frame's peak sits above the cap, nothing qualifies.
+        peak_thresh = min(peak_floor + cfg.bright_margin * cfg.sensitivity, cfg.peak_cap)
 
     return Profile(
         luma_floor=luma_floor,
