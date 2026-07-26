@@ -35,6 +35,9 @@ pip install .
 
 # Or, for development (editable install):
 pip install -e .
+
+# To also install the optional graphical tuner (PySide6):
+pip install ".[gui]"
 ```
 
 You can then run `chaptermark ...` from anywhere. If you'd rather not install,
@@ -58,6 +61,41 @@ chaptermark "D:\Shows\My Show"
 # Only scan the top-level folder, ignore subfolders:
 chaptermark "D:\Tapes" --no-recursive
 ```
+
+## Graphical tuner (`--gui`)
+
+If you installed the optional GUI (`pip install ".[gui]"`), add `--gui` to open a
+visual tuner instead of running the scan:
+
+```bash
+chaptermark "D:\Shows\My Show" --gui
+```
+
+The window lists every file next to a timeline showing exactly where chapters
+would land. Every command-line option is a control — sliders for thresholds,
+checkboxes for on/off flags — and any options you pass on the command line
+pre-populate them. The recommended workflow:
+
+1. **Open a folder.** It reads the existing `.chapterprofiles` cache and draws
+   the timelines immediately. It does **not** decode anything automatically.
+   Profiles saved by an older version (before the format changed) still preview,
+   but are shown in muted colours with an *"outdated"* tag and an amber filename —
+   click **Analyze** to refresh them to the current sampling (the blank-guard /
+   peak features stay off on a file until it's re-analyzed).
+2. **Analyze.** For files with no cached profile yet (shown as *not analyzed*),
+   click **Analyze** to run the one-time ffmpeg decode pass. This is the only
+   slow step, and it runs in the background with a progress bar.
+3. **Tune live.** Drag any slider or toggle any box — every file's timeline
+   re-computes and redraws instantly, because detection runs on the cached
+   signals (no re-decoding). Green tick = the 00:00 intro marker; orange tick =
+   a detected break; gridlines every 5 minutes.
+4. **Save / Write.** Writes the sidecar `.chapters.xml`/`.txt` files with the
+   current settings. If the **Embed** checkbox is ticked, it also embeds the
+   chapters into each `.mkv` in place (needs mkvpropedit).
+
+Changing a **Sampling** control (video fps / audio window) requires a re-decode,
+so the Analyze button will say *"Analyze (sampling changed)"* and re-profile on
+the next run. The GUI never modifies files until you press Save.
 
 > The examples below use the installed `chaptermark` command; `python -m chaptermaker`
 > works identically if you didn't install.

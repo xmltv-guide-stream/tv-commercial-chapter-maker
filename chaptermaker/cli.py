@@ -291,8 +291,11 @@ def build_parser() -> argparse.ArgumentParser:
                     "breaks in video files (built for messy VHS/DVR rips).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("folder", help="Folder to scan for video files")
+    p.add_argument("folder", nargs="?", default=None,
+                   help="Folder to scan for video files (optional when launching --gui)")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    p.add_argument("--gui", action="store_true",
+                   help="Launch the graphical tuner instead of scanning. Any other options passed pre-populate the controls; nothing runs until you click Analyze / Save in the window")
 
     scan = p.add_argument_group("scanning")
     scan.add_argument("-r", "--recursive", dest="recursive", action="store_true", default=True,
@@ -372,6 +375,22 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+
+    # GUI mode: hand off to the (optional) PySide6 tuner. Imported lazily so the
+    # CLI has no GUI dependency and its behaviour is entirely unchanged.
+    if args.gui:
+        try:
+            from . import gui
+        except ImportError as e:
+            print(f"The GUI needs PySide6, which isn't installed.\n"
+                  f"  Install it with:  pip install PySide6\n  ({e})", file=sys.stderr)
+            return 4
+        start = Path(args.folder).expanduser() if args.folder else None
+        return gui.launch(start, build_config(args), args)
+
+    if args.folder is None:
+        print("error: a folder is required (or pass --gui to open the tuner)", file=sys.stderr)
+        return 2
     target = Path(args.folder).expanduser()
     if not target.exists():
         print(f"Path not found: {target}", file=sys.stderr)
