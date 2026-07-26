@@ -15,6 +15,7 @@ import gzip
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 
 from .probe import Signals
@@ -44,26 +45,95 @@ class ProfileCache:
             cache_dir = os.path.join(root, CACHE_DIRNAME)
         self.dir = Path(cache_dir)
         self.dir.mkdir(parents=True, exist_ok=True)
+        self._src_index: dict[str, Path] | None = None
 
     def _entry_path(self, path: str) -> Path:
         return self.dir / f"{_key(path)}.json.gz"
+
+    @staticmethod
+    def _norm(path: str) -> str:
+        return os.path.normcase(os.path.abspath(path))
+
+    def _peek_source(self, entry: Path) -> str | None:
+        """Read just the "source" path from an entry without decoding the big
+        signal arrays (source is written before them). Used to re-associate an
+        entry whose stat-key no longer matches the file (e.g. after embedding
+        changed its mtime)."""
+        try:
+            with gzip.open(entry, "rt", encoding="utf-8") as fh:
+                head = fh.read(4096)
+        except OSError:
+            return None
+        m = re.search(r'"source"\s*:\s*"((?:[^"\\]|\\.)*)"', head)
+        if not m:
+            return None
+        try:
+            return json.loads('"' + m.group(1) + '"')
+        except ValueError:
+            return None
+
+    def _source_index(self) -> dict[str, Path]:
+        """Map normalized source path -> entry file, built once and cached."""
+        if self._src_index is None:
+            idx: dict[str, Path] = {}
+            for f in self.dir.glob("*.json.gz"):
+                src = self._peek_source(f)
+                if src:
+                    idx[self._norm(src)] = f
+            self._src_index = idx
+        return self._src_index
 
     def entry_path(self, path: str) -> Path:
         """Public accessor for a file's cache entry path (keyed on current stat)."""
         return self._entry_path(path)
 
-    def get(self, path: str) -> Signals | None:
-        p = self._entry_path(path)
+    def _load_raw(self, path: str) -> tuple[Signals | None, str]:
+        """Load an entry regardless of version. Returns (signals, status) where
+        status is 'missing', 'current', or 'stale' (loadable but an older
+        format). Corrupt/unreadable entries come back as (None, 'missing')."""
+        try:
+            p = self._entry_path(path)   # stats the file to build its key
+        except OSError:
+            return None, "missing"       # file vanished -> nothing to load
         if not p.exists():
-            return None
+            return None, "missing"
         try:
             with gzip.open(p, "rt", encoding="utf-8") as fh:
                 data = json.load(fh)
-            if data.get("version") != SIGNALS_VERSION:
-                return None  # stale format -> recompute with current sampling
-            return Signals.from_dict(data["signals"])
+            sig = Signals.from_dict(data["signals"])
         except (OSError, KeyError, ValueError):
-            return None  # corrupt/partial cache -> just recompute
+            return None, "missing"  # corrupt/partial -> treat as absent
+        status = "current" if data.get("version") == SIGNALS_VERSION else "stale"
+        return sig, status
+
+    def get(self, path: str) -> Signals | None:
+        """Return signals only if the cached profile is the current format.
+        Stale/missing -> None, so callers (the CLI) transparently re-decode."""
+        sig, status = self._load_raw(path)
+        return sig if status == "current" else None
+
+    def get_any(self, path: str) -> tuple[Signals | None, str]:
+        """Load even a stale-format profile (for previewing), with its status.
+        Used by the GUI so old profiles still draw a timeline while being clearly
+        flagged as outdated and re-analyzable.
+
+        If the exact stat-key entry is missing, fall back to matching by the
+        source path recorded inside each entry — this recovers profiles that
+        were orphaned when the file's mtime/size changed (most often because a
+        previous run embedded chapters into the MKV). Such a profile is surfaced
+        as 'stale' since it no longer matches the file's current stat."""
+        sig, status = self._load_raw(path)
+        if status != "missing":
+            return sig, status
+        entry = self._source_index().get(self._norm(path))
+        if entry is None:
+            return None, "missing"
+        try:
+            with gzip.open(entry, "rt", encoding="utf-8") as fh:
+                data = json.load(fh)
+            return Signals.from_dict(data["signals"]), "stale"
+        except (OSError, KeyError, ValueError):
+            return None, "missing"
 
     def put(self, path: str, signals: Signals) -> None:
         p = self._entry_path(path)
@@ -77,6 +147,7 @@ class ProfileCache:
             with gzip.open(tmp, "wt", encoding="utf-8") as fh:
                 json.dump(payload, fh)
             tmp.replace(p)
+            self._src_index = None  # a new entry exists; rebuild index on demand
         except OSError as e:
             print(f"  ! could not cache profile: {e}")
 
