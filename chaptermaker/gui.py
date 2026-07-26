@@ -282,14 +282,17 @@ class SaveWorker(QThread):
                 paths = write_sidecars(path, breaks)
                 if self.embed and path.lower().endswith(".mkv"):
                     try:
-                        prior = self.cache.entry_path(path)
+                        # Capture the entry BEFORE embedding changes the mtime.
+                        prior = self.cache.resolve_entry(path)
                         embed_chapters(path, paths["xml"])
-                        # Only refresh the cache for a current-format profile.
-                        # Re-tagging a stale profile as current would hide that it
-                        # still lacks peak data; instead let the mtime change from
-                        # embedding invalidate it so it re-analyzes cleanly.
+                        # Embedding doesn't change the audio/video, so carry the
+                        # profile forward to the new stat-key rather than orphan
+                        # it. Current profiles are rewritten fresh; a stale one is
+                        # just re-keyed so it stays valid but still flagged old.
                         if status == "current":
                             self.cache.reput(path, sig, prior)
+                        else:
+                            self.cache.rekey(prior, path)
                     except MkvpropeditNotFound:
                         mkv_missing = True
                 written += 1
