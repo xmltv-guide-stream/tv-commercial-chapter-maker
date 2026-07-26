@@ -43,6 +43,7 @@ def build_config(args) -> DetectConfig:
         quiet_floor_trim=args.quiet_floor_trim,
         blank_guard=args.blank_guard,
         bright_margin=args.bright_margin,
+        peak_cap=args.peak_cap,
         near_miss=args.near_miss,
         near_deep=args.near_deep,
         near_tol=args.near_tol,
@@ -105,8 +106,13 @@ def diagnose_file(path: Path, cache: ProfileCache, cfg: DetectConfig, args, root
               f"(gate needs >= {_MIN_SPREAD_LUMA})")
         print(f"  black_thresh = {'OFF (no dark excursion)' if not np.isfinite(bt) else f'{bt:.1f}'}")
         if prof.peak_thresh is not None:
+            capped = prof.peak_thresh >= cfg.peak_cap - 1e-9
+            capnote = f" [hit absolute cap {cfg.peak_cap:.0f}]" if capped else ""
             print(f"  peak(blank-guard): darkest-peak floor={prof.peak_floor:.1f}  "
-                  f"peak_thresh={prof.peak_thresh:.1f} (a dark frame must peak <= this)")
+                  f"peak_thresh={prof.peak_thresh:.1f} (a dark frame must peak <= this){capnote}")
+            if prof.peak_floor > cfg.peak_cap:
+                print(f"    note: even the darkest frame's peak ({prof.peak_floor:.1f}) exceeds the cap "
+                      f"-> no frame is 'blank' -> no dark breaks (file never truly goes dark)")
         elif cfg.blank_guard:
             print("  peak(blank-guard): no peak data (legacy cache) — re-run with --reprofile to enable")
     else:
@@ -317,6 +323,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Disable the blank guard: normally a frame must be dark at its brightest region too, so a scene on a black background (bright objects, dark background) isn't mistaken for a blank/fade frame")
     tune.add_argument("--bright-margin", type=float, default=32.0,
                       help="Blank guard: how far a frame's peak brightness may rise above the file's darkest-peak level and still count as 'blank' (lower = stricter about rejecting on-black content)")
+    tune.add_argument("--peak-cap", type=float, default=100.0,
+                      help="Blank guard: absolute peak-brightness ceiling (0..255). A frame brighter than this at its peak is never treated as blank, so a file with no truly dark frames gets no dark breaks instead of marking its dimmest scenes")
     tune.add_argument("--quiet-margin", type=float, default=8.0,
                       help="dB above the file's quietest level still counted as 'silent'")
     tune.add_argument("--quiet-floor-trim", type=float, default=0.01,
