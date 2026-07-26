@@ -112,6 +112,38 @@ class ProfileCache:
         sig, status = self._load_raw(path)
         return sig if status == "current" else None
 
+    def resolve_entry(self, path: str) -> Path | None:
+        """The on-disk entry currently representing this file — the exact
+        stat-key entry if present, else one matched by stored source path.
+        Call *before* modifying the file (e.g. embedding) to capture it."""
+        try:
+            p = self._entry_path(path)
+        except OSError:
+            p = None
+        if p is not None and p.exists():
+            return p
+        return self._source_index().get(self._norm(path))
+
+    def rekey(self, old_entry, path: str) -> None:
+        """Rename an existing entry to the file's *current* stat-key. Used after
+        WE changed the file's mtime by embedding chapters: the audio/video is
+        unchanged, so the (possibly stale-format) profile is still valid — this
+        keeps it findable by exact key instead of orphaning it, preserving its
+        stored contents and version (so an outdated profile stays outdated)."""
+        if not old_entry:
+            return
+        try:
+            new = self._entry_path(path)
+        except OSError:
+            return
+        old = Path(old_entry)
+        if old.exists() and old != new:
+            try:
+                os.replace(old, new)
+                self._src_index = None
+            except OSError:
+                pass
+
     def get_any(self, path: str) -> tuple[Signals | None, str]:
         """Load even a stale-format profile (for previewing), with its status.
         Used by the GUI so old profiles still draw a timeline while being clearly
@@ -119,9 +151,11 @@ class ProfileCache:
 
         If the exact stat-key entry is missing, fall back to matching by the
         source path recorded inside each entry — this recovers profiles that
-        were orphaned when the file's mtime/size changed (most often because a
-        previous run embedded chapters into the MKV). Such a profile is surfaced
-        as 'stale' since it no longer matches the file's current stat."""
+        were orphaned when the file's mtime/size changed (an old build, or a
+        drive whose reported mtime drifts). The recovered profile reports its
+        REAL format version: a current-format profile stays 'current' (only its
+        stat drifted, not its data), and only a genuinely old format is 'stale'.
+        Outdated must mean old format, never merely 'located by source match'."""
         sig, status = self._load_raw(path)
         if status != "missing":
             return sig, status
@@ -131,7 +165,8 @@ class ProfileCache:
         try:
             with gzip.open(entry, "rt", encoding="utf-8") as fh:
                 data = json.load(fh)
-            return Signals.from_dict(data["signals"]), "stale"
+            status = "current" if data.get("version") == SIGNALS_VERSION else "stale"
+            return Signals.from_dict(data["signals"]), status
         except (OSError, KeyError, ValueError):
             return None, "missing"
 
