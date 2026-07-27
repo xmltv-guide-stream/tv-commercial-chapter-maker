@@ -26,15 +26,16 @@ import os
 import sys
 
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QPainter, QPen
+from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFrame,
-    QGroupBox, QHBoxLayout, QLabel, QMainWindow, QProgressBar, QPushButton,
-    QScrollArea, QSizePolicy, QSlider, QSpinBox, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
+    QFrame, QGroupBox, QHBoxLayout, QLabel, QMainWindow, QMenu, QPlainTextEdit,
+    QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox,
+    QVBoxLayout, QWidget,
 )
 
 from .chapters import MkvpropeditNotFound, embed_chapters, write_sidecars
-from .cli import VIDEO_EXTS, find_videos
+from .cli import VIDEO_EXTS, find_videos, format_diagnosis
 from .detect import DetectConfig, count_breaks, detect_to_target
 from .probe import probe_file
 from .profilecache import ProfileCache
@@ -218,13 +219,14 @@ class ProbeWorker(QThread):
     failed = Signal(str, str)          # path, message
     finishedAll = Signal()
 
-    def __init__(self, paths, cache, video_fps, audio_window, mode):
+    def __init__(self, paths, cache, video_fps, audio_window, mode, logo_detect=True):
         super().__init__()
         self.paths = list(paths)
         self.cache = cache
         self.video_fps = video_fps
         self.audio_window = audio_window
         self.mode = mode
+        self.logo_detect = logo_detect
         self._stop = False
 
     def stop(self):
@@ -247,7 +249,8 @@ class ProbeWorker(QThread):
                         or (self.mode == "analyze" and status != "current"))
                 if need:
                     sig = probe_file(path, video_fps=self.video_fps,
-                                     audio_window=self.audio_window)
+                                     audio_window=self.audio_window,
+                                     logo_detect=self.logo_detect)
                     self.cache.put(path, sig)
                     status = "current"
                 self.fileReady.emit(path, sig, status)
@@ -302,6 +305,73 @@ class SaveWorker(QThread):
         self.finishedAll.emit(written, mkv_missing)
 
 
+class DiagnoseWorker(QThread):
+    """Builds a file's diagnose report off the UI thread, decoding first only if
+    the file has no signals loaded yet."""
+
+    done = Signal(str, str, object)    # path, report text, Signals used
+    failed = Signal(str, str)
+
+    def __init__(self, path, sig, cache, cfg, video_fps, audio_window, logo_detect=True):
+        super().__init__()
+        self.path = path
+        self.sig = sig
+        self.cache = cache
+        self.cfg = cfg
+        self.video_fps = video_fps
+        self.audio_window = audio_window
+        self.logo_detect = logo_detect
+
+    def run(self):
+        try:
+            sig = self.sig
+            if sig is None:
+                sig = probe_file(self.path, video_fps=self.video_fps,
+                                 audio_window=self.audio_window,
+                                 logo_detect=self.logo_detect)
+                self.cache.put(self.path, sig)
+            text = format_diagnosis(os.path.basename(self.path), sig, self.cfg)
+            self.done.emit(self.path, text, sig)
+        except Exception as e:
+            self.failed.emit(self.path, str(e))
+
+
+class DiagnoseDialog(QDialog):
+    """A non-modal window showing a diagnose report in monospace, with a button
+    to copy the whole thing."""
+
+    def __init__(self, title, text, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Diagnose — {title}")
+        self.resize(860, 640)
+        lay = QVBoxLayout(self)
+        self.edit = QPlainTextEdit()
+        self.edit.setReadOnly(True)
+        self.edit.setLineWrapMode(QPlainTextEdit.NoWrap)
+        font = QFont("Consolas")
+        font.setStyleHint(QFont.Monospace)
+        font.setPointSize(10)
+        self.edit.setFont(font)
+        self.edit.setPlainText(text)
+        lay.addWidget(self.edit, 1)
+        btns = QHBoxLayout()
+        copy = QPushButton("Copy all")
+        copy.clicked.connect(self._copy)
+        close = QPushButton("Close")
+        close.clicked.connect(self.close)
+        self._copied = QLabel("")
+        self._copied.setStyleSheet("color:#8ab88a;")
+        btns.addWidget(self._copied)
+        btns.addStretch(1)
+        btns.addWidget(copy)
+        btns.addWidget(close)
+        lay.addLayout(btns)
+
+    def _copy(self):
+        QApplication.clipboard().setText(self.edit.toPlainText())
+        self._copied.setText("copied to clipboard")
+
+
 # --------------------------------------------------------------------------- #
 #  main window
 # --------------------------------------------------------------------------- #
@@ -325,6 +395,8 @@ class MainWindow(QMainWindow):
         self.checks: dict[str, QCheckBox] = {}
         self.combos: dict[str, QComboBox] = {}
         self._worker: QThread | None = None
+        self._diag_workers: list[QThread] = []
+        self._dialogs: list[QDialog] = []
         self._sampling_dirty = False
 
         self._debounce = QTimer(self)
@@ -386,6 +458,7 @@ class MainWindow(QMainWindow):
         g = self._group("Sampling — needs re-analyze", cl)
         self._float(g, "video_fps", "video fps", 1.0, 30.0, 1.0, live=False)
         self._float(g, "audio_window", "audio window (s)", 0.02, 0.5, 0.01, live=False)
+        self._check(g, "logo_detect", "detect + ignore channel logo/bug", live=False)
 
         g = self._group("Output", cl)
         self._check(g, "embed", "embed chapters into MKV on Save", live=False)
@@ -507,6 +580,7 @@ class MainWindow(QMainWindow):
             "ignore_audio": cfg.ignore_audio, "audio_fallback": cfg.audio_fallback,
             "blank_guard": cfg.blank_guard, "embed": getattr(args, "embed", False),
             "recursive": getattr(args, "recursive", True),
+            "logo_detect": getattr(args, "logo_detect", True),
         }.items():
             if k in self.checks:
                 self.checks[k].setChecked(bool(v))
@@ -572,6 +646,9 @@ class MainWindow(QMainWindow):
         for path in files:
             row = QFrame()
             row.setFrameShape(QFrame.StyledPanel)
+            row.setContextMenuPolicy(Qt.CustomContextMenu)
+            row.customContextMenuRequested.connect(
+                lambda pos, p=path, w=row: self._row_menu(p, w, pos))
             rl = QHBoxLayout(row)
             rl.setContentsMargins(6, 3, 6, 3)
             name = QLabel(os.path.basename(path))
@@ -641,6 +718,51 @@ class MainWindow(QMainWindow):
             parts.append("adjust sliders to preview live")
         self.status.setText("  ·  ".join(parts))
 
+    # -- per-file right-click menu ----------------------------------------- #
+
+    def _row_menu(self, path, widget, pos):
+        menu = QMenu(self)
+        act_diag = menu.addAction("Diagnose…")
+        act_re = menu.addAction("Re-analyze this file")
+        chosen = menu.exec(widget.mapToGlobal(pos))
+        if chosen == act_diag:
+            self._diagnose(path)
+        elif chosen == act_re:
+            self._reanalyze_one(path)
+
+    def _diagnose(self, path):
+        sig = self.signals.get(path)
+        w = DiagnoseWorker(path, sig, self.cache, self._cfg(),
+                           self.floats["video_fps"].value(),
+                           self.floats["audio_window"].value(),
+                           self.checks["logo_detect"].isChecked())
+        self._diag_workers.append(w)
+        w.done.connect(self._on_diag_done)
+        w.failed.connect(self._on_file_failed)
+        w.finished.connect(lambda w=w: self._diag_workers.remove(w)
+                           if w in self._diag_workers else None)
+        if sig is None:
+            self.status.setText(f"Diagnosing (decoding) {os.path.basename(path)}…")
+        w.start()
+
+    def _on_diag_done(self, path, text, sig):
+        # if we had to decode for the diagnose, keep the fresh signals
+        if self.signals.get(path) is None:
+            self.signals[path] = sig
+            self.file_status[path] = "current"
+            self._update_row(path, sig)
+            self._update_status()
+        dlg = DiagnoseDialog(os.path.basename(path), text, self)
+        self._dialogs.append(dlg)
+        dlg.finished.connect(lambda _=None, d=dlg: self._dialogs.remove(d)
+                             if d in self._dialogs else None)
+        dlg.show()
+
+    def _reanalyze_one(self, path):
+        if self._worker is not None:
+            return
+        self._start_worker([path], mode="reprofile")
+
     # -- workers ----------------------------------------------------------- #
 
     def _busy(self, on):
@@ -653,7 +775,8 @@ class MainWindow(QMainWindow):
             return
         w = ProbeWorker(files, self.cache,
                         self.floats["video_fps"].value(),
-                        self.floats["audio_window"].value(), mode)
+                        self.floats["audio_window"].value(), mode,
+                        self.checks["logo_detect"].isChecked())
         self._worker = w
         w.progress.connect(self._on_progress)
         w.fileReady.connect(self._on_file_ready)

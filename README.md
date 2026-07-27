@@ -19,6 +19,11 @@ It also **caches each file's profile** (the expensive ffmpeg decode pass), so
 if a batch is interrupted, re-running resumes instantly and re-tuning the
 detection is near-instant — no re-decoding.
 
+For **broadcast/DSR rips with a station logo** burned into a corner, it detects
+that persistent overlay (a pixel that's bright in every keyframe) and excludes
+it when measuring brightness — so a fade-to-black *behind* a logo is still
+recognized as a break. Disable with `--no-logo-detect` if needed.
+
 ## Requirements
 
 - **Python 3.9+**
@@ -96,6 +101,10 @@ pre-populate them. The recommended workflow:
 Changing a **Sampling** control (video fps / audio window) requires a re-decode,
 so the Analyze button will say *"Analyze (sampling changed)"* and re-profile on
 the next run. The GUI never modifies files until you press Save.
+
+**Right-click a file** for two actions: *Diagnose…* opens a copyable window with
+the same detailed brightness/loudness report as `--diagnose` (with a "Copy all"
+button), and *Re-analyze this file* re-decodes just that one file.
 
 > The examples below use the installed `chaptermark` command; `python -m chaptermaker`
 > works identically if you didn't install.

@@ -66,31 +66,31 @@ def _get_signals(path: Path, cache: ProfileCache, args):
     if sig is None:
         if args.verbose:
             print(f"  profiling (decoding)…", flush=True)
-        sig = probe_file(str(path), video_fps=args.video_fps, audio_window=args.audio_window)
+        sig = probe_file(str(path), video_fps=args.video_fps, audio_window=args.audio_window,
+                         logo_detect=getattr(args, "logo_detect", True))
         cache.put(str(path), sig)
     elif args.verbose:
         print("  using cached profile", flush=True)
     return sig
 
 
-def diagnose_file(path: Path, cache: ProfileCache, cfg: DetectConfig, args, root: Path) -> None:
-    """Print a detailed brightness/loudness report for one file, to explain why
-    breaks are (or aren't) being detected. Writes nothing."""
-    try:
-        rel = str(path.relative_to(root))
-    except ValueError:
-        rel = path.name
-    sig = _get_signals(path, cache, args)
+def format_diagnosis(rel: str, sig, cfg: DetectConfig) -> str:
+    """Build the detailed brightness/loudness report for one file as a string,
+    explaining why breaks are (or aren't) detected. Shared by the CLI (printed)
+    and the GUI (shown in a copyable window). Takes an already-loaded Signals so
+    it never decodes."""
     duration = sig.duration or (float(sig.v_times[-1]) if sig.v_times.size else 0.0)
     prof = build_profile(sig, cfg)
-
-    print(f"\n=== DIAGNOSE: {rel} ===")
-    print(f"duration={_fmt_clock(duration)}  mode={cfg.mode}  sensitivity={cfg.sensitivity}  "
-          f"min_duration={cfg.min_duration}s  min_gap={cfg.min_gap}s  skip_start={cfg.skip_start}s")
+    out: list[str] = []
+    p = out.append
 
     def stats(arr):
         return (f"min={np.min(arr):.1f} p1={np.percentile(arr,1):.1f} "
                 f"p5={np.percentile(arr,5):.1f} median={np.median(arr):.1f} max={np.max(arr):.1f}")
+
+    p(f"=== DIAGNOSE: {rel} ===")
+    p(f"duration={_fmt_clock(duration)}  mode={cfg.mode}  sensitivity={cfg.sensitivity}  "
+      f"min_duration={cfg.min_duration}s  min_gap={cfg.min_gap}s  skip_start={cfg.skip_start}s")
 
     # --- video ---
     L = sig.v_luma
@@ -100,23 +100,28 @@ def diagnose_file(path: Path, cache: ProfileCache, cfg: DetectConfig, args, root
         floor = _sustained_floor(L, sig.v_times, _FLOOR_SUSTAIN)
         spread = float(np.median(L)) - floor
         bt = prof.black_thresh
-        print(f"\nLUMA (0=black..255)  samples={L.size} (~{vfps:.1f}/s)")
-        print(f"  {stats(L)}")
-        print(f"  sustained_floor={floor:.1f}  spread_to_median={spread:.1f} "
-              f"(gate needs >= {_MIN_SPREAD_LUMA})")
-        print(f"  black_thresh = {'OFF (no dark excursion)' if not np.isfinite(bt) else f'{bt:.1f}'}")
+        p("")
+        p(f"LUMA (0=black..255)  samples={L.size} (~{vfps:.1f}/s)")
+        p(f"  {stats(L)}")
+        p(f"  sustained_floor={floor:.1f}  spread_to_median={spread:.1f} "
+          f"(gate needs >= {_MIN_SPREAD_LUMA})")
+        p(f"  black_thresh = {'OFF (no dark excursion)' if not np.isfinite(bt) else f'{bt:.1f}'}")
         if prof.peak_thresh is not None:
             capped = prof.peak_thresh >= cfg.peak_cap - 1e-9
             capnote = f" [hit absolute cap {cfg.peak_cap:.0f}]" if capped else ""
-            print(f"  peak(blank-guard): darkest-peak floor={prof.peak_floor:.1f}  "
-                  f"peak_thresh={prof.peak_thresh:.1f} (a dark frame must peak <= this){capnote}")
+            p(f"  peak(blank-guard): darkest-peak floor={prof.peak_floor:.1f}  "
+              f"peak_thresh={prof.peak_thresh:.1f} (a dark frame must peak <= this){capnote}")
             if prof.peak_floor > cfg.peak_cap:
-                print(f"    note: even the darkest frame's peak ({prof.peak_floor:.1f}) exceeds the cap "
-                      f"-> no frame is 'blank' -> no dark breaks (file never truly goes dark)")
+                p(f"    note: even the darkest frame's peak ({prof.peak_floor:.1f}) exceeds the cap "
+                  f"-> no frame is 'blank' -> no dark breaks (file never truly goes dark)")
         elif cfg.blank_guard:
-            print("  peak(blank-guard): no peak data (legacy cache) — re-run with --reprofile to enable")
+            p("  peak(blank-guard): no peak data (legacy cache) — re-run with --reprofile to enable")
+        if getattr(sig, "logo_frac", 0.0) > 0.0:
+            p(f"  logo/overlay detected: {sig.logo_frac:.1%} of frame excluded from peak "
+              f"(so a fade behind a channel bug still reads as blank)")
     else:
-        print("\nLUMA: no video samples!")
+        p("")
+        p("LUMA: no video samples!")
 
     # --- audio ---
     R = sig.a_rms
@@ -125,16 +130,18 @@ def diagnose_file(path: Path, cache: ProfileCache, cfg: DetectConfig, args, root
         floor = _sustained_floor(R, sig.a_times, _FLOOR_SUSTAIN, cfg.quiet_floor_trim)
         spread = float(np.median(R)) - floor
         qt = prof.quiet_thresh
-        print(f"\nAUDIO RMS (dBFS)  samples={R.size}")
-        print(f"  {stats(R)}")
+        p("")
+        p(f"AUDIO RMS (dBFS)  samples={R.size}")
+        p(f"  {stats(R)}")
         trimnote = (f"  (raw min-floor {raw_floor:.1f}dB trimmed {cfg.quiet_floor_trim:.1%} "
                     f"-> ignores silent-outro/digital-silence)" if cfg.quiet_floor_trim > 0
                     and abs(floor - raw_floor) > 0.05 else "")
-        print(f"  quiet_floor={floor:.1f}dB  spread_to_median={spread:.1f}dB "
-              f"(gate needs >= {_MIN_SPREAD_DB}){trimnote}")
-        print(f"  quiet_thresh = {'OFF (no quiet excursion)' if not np.isfinite(qt) else f'{qt:.1f}dB'}")
+        p(f"  quiet_floor={floor:.1f}dB  spread_to_median={spread:.1f}dB "
+          f"(gate needs >= {_MIN_SPREAD_DB}){trimnote}")
+        p(f"  quiet_thresh = {'OFF (no quiet excursion)' if not np.isfinite(qt) else f'{qt:.1f}dB'}")
     else:
-        print("\nAUDIO: none / not usable -> detection is video-only")
+        p("")
+        p("AUDIO: none / not usable -> detection is video-only")
 
     # --- grid masks: how much qualifies, and under which rule ---
     grid = np.arange(0.0, duration, cfg.grid_step)
@@ -154,21 +161,21 @@ def diagnose_file(path: Path, cache: ProfileCache, cfg: DetectConfig, args, root
     pct = lambda m: 100.0 * np.count_nonzero(m) / max(1, m.size)
     nm = ""
     if cfg.near_miss and cfg.mode == "and" and black_ok and quiet_ok:
-        rescued = np.count_nonzero(combined_mask & ~(black_mask & quiet_mask))
         nm = f"  near-miss rescues={pct(combined_mask & ~(black_mask & quiet_mask)):.2f}%"
     bg = ""
     if peak_g is not None and prof.peak_thresh is not None:
-        blocked = np.count_nonzero(raw_dark & ~black_mask)
         bg = f"  blank-guard rejects={pct(raw_dark & ~black_mask):.2f}% (dark-average but bright peak)"
-    print(f"\nGRID (@{cfg.grid_step}s)  dark={pct(black_mask):.2f}%  quiet={pct(quiet_mask):.2f}%  "
-          f"dark&quiet={pct(black_mask & quiet_mask):.2f}%  dark|quiet={pct(black_mask | quiet_mask):.2f}%"
-          f"  kept={pct(combined_mask):.2f}%{nm}{bg}")
+    p("")
+    p(f"GRID (@{cfg.grid_step}s)  dark={pct(black_mask):.2f}%  quiet={pct(quiet_mask):.2f}%  "
+      f"dark&quiet={pct(black_mask & quiet_mask):.2f}%  dark|quiet={pct(black_mask | quiet_mask):.2f}%"
+      f"  kept={pct(combined_mask):.2f}%{nm}{bg}")
 
     # --- the darkest moments, and what the audio is doing there ---
     have_peak = peak_g is not None
     pkhdr = f"  {'peak':>5}" if have_peak else ""
-    print("\nDarkest moments (spaced >=2s apart):")
-    print(f"  {'time':>8}  {'luma':>6}{pkhdr}  {'rms(dB)':>8}  dark? quiet? keep?")
+    p("")
+    p("Darkest moments (spaced >=2s apart):")
+    p(f"  {'time':>8}  {'luma':>6}{pkhdr}  {'rms(dB)':>8}  dark? quiet? keep?")
     kept_t: list[float] = []
     for i in np.argsort(luma_g):
         t = float(grid[i])
@@ -187,23 +194,35 @@ def diagnose_file(path: Path, cache: ProfileCache, cfg: DetectConfig, args, root
             flag = ""
         rv = f"{rms_g[i]:.1f}" if quiet_ok else "n/a"
         pk = f"  {peak_g[i]:5.1f}" if have_peak else ""
-        print(f"  {_fmt_clock(t):>8}  {luma_g[i]:6.1f}{pk}  {rv:>8}   {d}   {q}   {k}{flag}")
+        p(f"  {_fmt_clock(t):>8}  {luma_g[i]:6.1f}{pk}  {rv:>8}   {d}   {q}   {k}{flag}")
         if len(kept_t) >= 15:
             break
 
     # --- interpretation hint ---
     breaks, _, _ = detect_to_target(sig, cfg)
-    print(f"\nWith current settings -> {count_breaks(breaks)} breaks detected.")
+    p("")
+    p(f"With current settings -> {count_breaks(breaks)} breaks detected.")
     if cfg.mode == "and" and black_ok and quiet_ok:
         dark_not_quiet = np.count_nonzero(black_mask & ~quiet_mask)
         if dark_not_quiet > np.count_nonzero(black_mask & quiet_mask):
-            print("  Hint: many dark moments are NOT quiet — 'and' mode is dropping real breaks.")
-            print("        The audio is an unreliable signal here; try --ignore-audio "
-                  "(video-only), or --mode or.")
+            p("  Hint: many dark moments are NOT quiet — 'and' mode is dropping real breaks.")
+            p("        The audio is an unreliable signal here; try --ignore-audio "
+              "(video-only), or --mode or.")
     if black_ok and np.count_nonzero(black_mask) and count_breaks(breaks) == 0:
-        print("  Hint: dark moments exist but none survived. Try lowering --min-duration "
-              "(e.g. 0.1) or --min-gap, or raise --sensitivity.")
-    print("=== END DIAGNOSE ===\n")
+        p("  Hint: dark moments exist but none survived. Try lowering --min-duration "
+          "(e.g. 0.1) or --min-gap, or raise --sensitivity.")
+    p("=== END DIAGNOSE ===")
+    return "\n".join(out)
+
+
+def diagnose_file(path: Path, cache: ProfileCache, cfg: DetectConfig, args, root: Path) -> None:
+    """Print a detailed brightness/loudness report for one file. Writes nothing."""
+    try:
+        rel = str(path.relative_to(root))
+    except ValueError:
+        rel = path.name
+    sig = _get_signals(path, cache, args)
+    print("\n" + format_diagnosis(rel, sig, cfg) + "\n")
 
 
 def process_file(path: Path, cache: ProfileCache, cfg: DetectConfig, args, root: Path) -> int:
@@ -356,6 +375,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help="Frames per second sampled for brightness analysis (higher catches briefer breaks; decode cost is nearly unchanged)")
     sampling.add_argument("--audio-window", type=float, default=0.1,
                           help="Audio RMS window length in seconds")
+    sampling.add_argument("--no-logo-detect", dest="logo_detect", action="store_false", default=True,
+                          help="Disable detection of a persistent channel logo/bug. Normally a static bright overlay (common on DSR/broadcast rips) is found and excluded from the peak so a fade behind it is still recognized as blank")
 
     out = p.add_argument_group("output")
     out.add_argument("--embed", action="store_true",
