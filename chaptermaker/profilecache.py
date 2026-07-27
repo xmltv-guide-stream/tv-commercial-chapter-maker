@@ -28,7 +28,10 @@ CACHE_DIRNAME = ".chapterprofiles"
 #   1: original luma+audio
 #   2: added per-frame peak (95th @128x72)
 #   3: peak now 99.9th @256x144 so faint highlights survive downscale
-SIGNALS_VERSION = 3
+#   4: peak excludes a detected persistent overlay (channel logo/bug)
+#   5: logo detected via low-percentile (was min) so a black intro/outro or a
+#      few dark scenes over the logo no longer hide it
+SIGNALS_VERSION = 5
 
 
 def _key(path: str) -> str:
