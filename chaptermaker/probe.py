@@ -63,6 +63,9 @@ class Signals:
     # per-frame high-percentile luma (brightest region). None for legacy caches
     # profiled before this signal existed -> detection skips the blank guard.
     v_peak: np.ndarray | None = None
+    # fraction of the frame occupied by a detected persistent overlay (channel
+    # logo / bug) that was excluded from the peak. 0.0 = none detected.
+    logo_frac: float = 0.0
 
     def as_dict(self) -> dict:
         d = {
@@ -72,6 +75,7 @@ class Signals:
             "a_times": self.a_times.tolist(),
             "a_rms": self.a_rms.tolist(),
             "has_audio": self.has_audio,
+            "logo_frac": self.logo_frac,
         }
         if self.v_peak is not None:
             d["v_peak"] = self.v_peak.tolist()
@@ -88,6 +92,7 @@ class Signals:
             a_rms=np.asarray(d["a_rms"], dtype=np.float64),
             has_audio=d["has_audio"],
             v_peak=None if peak is None else np.asarray(peak, dtype=np.float64),
+            logo_frac=float(d.get("logo_frac", 0.0)),
         )
 
 
@@ -165,16 +170,81 @@ def _finish(proc, produced: bool, what: str) -> None:
 # bright pixels into the surrounding black and no percentile can recover them.
 _PEAK_PCT = 99.9
 
+# --- persistent-overlay (channel logo / bug) detection --------------------- #
+# A broadcast/DSR source often has a station logo burned into a fixed spot. It
+# stays lit even when the picture fades to black, so its bright pixels keep the
+# per-frame peak high and the blank guard wrongly concludes the file never goes
+# dark. We find it from the file's keyframes: a pixel that stays bright across
+# *almost all* of them is a static overlay, not scene content (which dips dark
+# at some point over a whole episode). We use a low PERCENTILE per pixel rather
+# than the strict minimum, so a black cold-open/outro or a few dark scenes over
+# the logo don't hide it (one dark frame would defeat a pure minimum). Those
+# pixels are then excluded from the peak so a fade-behind-a-logo reads dark.
+_LOGO_MIN_LEVEL = 48.0    # a pixel bright even at its low percentile = persistent
+_LOGO_PCTL = 10.0         # "bright in >=90% of keyframes" (tolerates intro/outro black)
+_LOGO_MAX_FRAC = 0.05     # if "persistent bright" exceeds this, it's not a logo
+_LOGO_MIN_KEYFRAMES = 8   # too few keyframes -> not enough evidence, skip
+_LOGO_MAX_KEYFRAMES = 1500  # cap frames held in memory for the percentile
 
-def _sample_video(path: str, fps: float, scale_w: int, scale_h: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+
+def _logo_mask(path: str, scale_w: int, scale_h: int):
+    """Return (flat bool mask of overlay pixels, fraction) or (None, 0.0).
+
+    Decodes only keyframes (`-skip_frame nokey`) so this extra pass is cheap.
+    Never raises for decode issues — a failure just means "no logo detected",
+    leaving peak computation exactly as it was."""
+    frame_bytes = scale_w * scale_h
+    proc = _popen([
+        "-skip_frame", "nokey", "-i", path, "-map", "0:v:0",
+        "-an", "-sn", "-dn", "-vsync", "0",
+        "-vf", f"scale={scale_w}:{scale_h}", "-pix_fmt", "gray", "-f", "rawvideo", "-",
+    ])
+    frames: list[np.ndarray] = []
+    try:
+        while len(frames) < _LOGO_MAX_KEYFRAMES:
+            buf = _read_exact(proc.stdout, frame_bytes)
+            if len(buf) < frame_bytes:
+                break
+            frames.append(np.frombuffer(buf, dtype=np.uint8))
+    except Exception:
+        frames = []
+    finally:
+        try:
+            proc.kill()  # we may have stopped early at the cap
+        except Exception:
+            pass
+        try:
+            if proc.stderr:
+                proc.stderr.read()
+            proc.wait()
+        except Exception:
+            pass
+    if len(frames) < _LOGO_MIN_KEYFRAMES:
+        return None, 0.0
+    # low percentile per pixel: bright even here => bright in >= (100-pctl)% of frames
+    lo = np.percentile(np.stack(frames), _LOGO_PCTL, axis=0)
+    thresh = max(_LOGO_MIN_LEVEL, float(np.median(lo)) + 40.0)
+    mask = lo >= thresh
+    frac = float(mask.mean())
+    if frac <= 0.0 or frac > _LOGO_MAX_FRAC:
+        return None, 0.0   # nothing, or too big to be a logo -> ignore
+    return mask, frac
+
+
+def _sample_video(path: str, fps: float, scale_w: int, scale_h: int,
+                  logo_mask=None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return (times, luma, peak), each 0..255, from raw grayscale frames at `fps`.
 
     luma = frame mean (scale-invariant, so cheap to compute at any size); peak =
     the frame's high-percentile brightness. A blank frame is dark in both; a
     scene on a black background — even a very dark one with only faint detail —
     has a low mean but a peak that rises above the file's darkest frames, which
-    is how detection avoids marking dark-scene frames as breaks."""
+    is how detection avoids marking dark-scene frames as breaks.
+
+    `logo_mask` (a flat bool array of persistent-overlay pixels) is excluded from
+    the peak so a channel logo can't hold the peak up during a real fade."""
     frame_bytes = scale_w * scale_h
+    keep = ~logo_mask if logo_mask is not None else None
     proc = _popen([
         "-i", path, "-map", "0:v:0", "-an", "-sn", "-dn",
         "-vf", f"fps={fps},scale={scale_w}:{scale_h}",
@@ -188,7 +258,7 @@ def _sample_video(path: str, fps: float, scale_w: int, scale_h: int) -> tuple[np
             break  # clean EOF (ignore any partial trailing frame)
         px = np.frombuffer(buf, dtype=np.uint8)
         luma.append(float(px.mean()))
-        peak.append(float(np.percentile(px, _PEAK_PCT)))
+        peak.append(float(np.percentile(px[keep] if keep is not None else px, _PEAK_PCT)))
     _finish(proc, produced=bool(luma), what="video")
     times = np.arange(len(luma), dtype=np.float64) / fps
     return times, np.asarray(luma, dtype=np.float64), np.asarray(peak, dtype=np.float64)
@@ -226,10 +296,19 @@ def probe_file(
     audio_window: float = 0.1,
     scale_w: int = 256,
     scale_h: int = 144,
+    logo_detect: bool = True,
 ) -> Signals:
     """Profile one file into brightness and loudness time series."""
     duration = probe_duration(path)
-    v_times, v_luma, v_peak = _sample_video(path, video_fps, scale_w, scale_h)
+    logo_mask, logo_frac = (None, 0.0)
+    if logo_detect:
+        try:
+            logo_mask, logo_frac = _logo_mask(path, scale_w, scale_h)
+        except FfmpegNotFound:
+            raise
+        except Exception:
+            logo_mask, logo_frac = None, 0.0   # never let logo detection break profiling
+    v_times, v_luma, v_peak = _sample_video(path, video_fps, scale_w, scale_h, logo_mask)
     has_audio = _has_audio_stream(path)
     if has_audio:
         a_times, a_rms = _sample_audio_rms(path, audio_window)
@@ -241,4 +320,5 @@ def probe_file(
         a_times=a_times, a_rms=a_rms,
         has_audio=has_audio,
         v_peak=v_peak,
+        logo_frac=logo_frac,
     )
