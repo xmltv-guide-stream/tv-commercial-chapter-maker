@@ -215,6 +215,45 @@ def format_diagnosis(rel: str, sig, cfg: DetectConfig) -> str:
     return "\n".join(out)
 
 
+def candidate_moments(sig, cfg: DetectConfig, limit: int = 40, spacing: float = 2.0) -> list[dict]:
+    """The file's darkest moments as data (not text): the same rows --diagnose
+    lists, each a dict with time/luma/peak/rms and dark/quiet/keep flags. Used by
+    the GUI's manual override so a user can hand-pick chapters from real
+    candidates without touching the detection settings."""
+    prof = build_profile(sig, cfg)
+    duration = sig.duration or (float(sig.v_times[-1]) if sig.v_times.size else 0.0)
+    grid = np.arange(0.0, duration, cfg.grid_step)
+    if grid.size == 0:
+        return []
+    luma_g = _resample(sig.v_times, sig.v_luma, grid)
+    black_ok = np.isfinite(prof.black_thresh)
+    quiet_ok = sig.has_audio and sig.a_rms.size > 0 and np.isfinite(prof.quiet_thresh)
+    rms_g = _resample(sig.a_times, sig.a_rms, grid) if quiet_ok else np.full(grid.shape, np.nan)
+    peak_g = (_resample(sig.v_times, sig.v_peak, grid)
+              if getattr(sig, "v_peak", None) is not None and sig.v_peak.size else None)
+    combined, black_mask, quiet_mask = _combined_mask(
+        luma_g, rms_g, prof, cfg, black_ok, quiet_ok, peak_g)
+    rows: list[dict] = []
+    kept_t: list[float] = []
+    for i in np.argsort(luma_g):
+        t = float(grid[i])
+        if any(abs(t - kt) < spacing for kt in kept_t):
+            continue
+        kept_t.append(t)
+        rows.append({
+            "time": t,
+            "luma": float(luma_g[i]),
+            "peak": float(peak_g[i]) if peak_g is not None else None,
+            "rms": float(rms_g[i]) if quiet_ok else None,
+            "dark": bool(black_mask[i]),
+            "quiet": bool(quiet_ok and quiet_mask[i]),
+            "keep": bool(combined[i]),
+        })
+        if len(rows) >= limit:
+            break
+    return sorted(rows, key=lambda r: r["time"])
+
+
 def diagnose_file(path: Path, cache: ProfileCache, cfg: DetectConfig, args, root: Path) -> None:
     """Print a detailed brightness/loudness report for one file. Writes nothing."""
     try:
