@@ -102,9 +102,17 @@ Changing a **Sampling** control (video fps / audio window) requires a re-decode,
 so the Analyze button will say *"Analyze (sampling changed)"* and re-profile on
 the next run. The GUI never modifies files until you press Save.
 
-**Right-click a file** for two actions: *Diagnose…* opens a copyable window with
-the same detailed brightness/loudness report as `--diagnose` (with a "Copy all"
-button), and *Re-analyze this file* re-decodes just that one file.
+**Right-click a file** for these actions:
+
+- *Diagnose…* — a copyable window with the same detailed report as `--diagnose`.
+- *Override chapters…* — hand-pick this one file's chapters. You get a checklist
+  of its candidate moments (the same timestamps the diagnose lists, with their
+  luma/peak/loudness), with the currently-detected chapters pre-checked. Tick or
+  untick any, or type a custom time. Your picks show on the timeline in cyan
+  (tagged "manual") and are written on Save. **Detection settings are not
+  changed** — this overrides only that file, which is handy when one outlier
+  frame kept a real break from being detected. *Clear override* reverts to auto.
+- *Re-analyze this file* — re-decode just that one file.
 
 > The examples below use the installed `chaptermark` command; `python -m chaptermaker`
 > works identically if you didn't install.

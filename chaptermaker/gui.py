@@ -29,14 +29,14 @@ from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
-    QFrame, QGroupBox, QHBoxLayout, QLabel, QMainWindow, QMenu, QPlainTextEdit,
-    QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox,
-    QVBoxLayout, QWidget,
+    QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMenu,
+    QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSlider,
+    QSpinBox, QVBoxLayout, QWidget,
 )
 
 from .chapters import MkvpropeditNotFound, embed_chapters, write_sidecars
-from .cli import VIDEO_EXTS, find_videos, format_diagnosis
-from .detect import DetectConfig, count_breaks, detect_to_target
+from .cli import VIDEO_EXTS, candidate_moments, find_videos, format_diagnosis
+from .detect import Break, DetectConfig, count_breaks, detect_to_target
 from .probe import probe_file
 from .profilecache import ProfileCache
 
@@ -55,6 +55,34 @@ def _hms(seconds: float) -> str:
 def _decimals(step: float) -> int:
     txt = f"{step:.6f}".rstrip("0").rstrip(".")
     return len(txt.split(".")[1]) if "." in txt else 0
+
+
+def _parse_time(s: str):
+    """Parse 'H:MM:SS', 'MM:SS', or plain seconds into float seconds, or None."""
+    s = s.strip()
+    if not s:
+        return None
+    try:
+        parts = [float(p) for p in s.split(":")]
+    except ValueError:
+        return None
+    sec = 0.0
+    for p in parts:
+        sec = sec * 60.0 + p
+    return sec
+
+
+def _manual_breaks(times, cfg: DetectConfig) -> list:
+    """Build Break objects from hand-picked chapter times, honouring the same
+    00:00 intro rule as automatic detection."""
+    breaks = [Break(time=float(t), start=float(t), end=float(t), duration=0.0,
+                    min_luma=float("nan"), min_rms=float("nan"), score=1.0)
+              for t in sorted(times)]
+    if cfg.add_intro and (not breaks or breaks[0].time > 1.0):
+        breaks.insert(0, Break(time=0.0, start=0.0, end=0.0, duration=0.0,
+                               min_luma=float("nan"), min_rms=float("nan"),
+                               score=0.0, is_intro=True))
+    return breaks
 
 
 class FloatControl(QWidget):
@@ -132,6 +160,7 @@ class TimelineView(QWidget):
         self.duration = 0.0
         self.marks: list[tuple[float, bool]] | None = None
         self.stale = False
+        self.manual = False
         self.placeholder = "not analyzed"
         self.setMinimumHeight(30)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -141,16 +170,23 @@ class TimelineView(QWidget):
         self.duration = 0.0
         self.marks = None
         self.stale = False
+        self.manual = False
         self.setToolTip("")
         self.update()
 
-    def set_data(self, duration, marks, stale=False):
+    def set_data(self, duration, marks, stale=False, manual=False):
         self.duration = float(duration or 0.0)
         self.marks = list(marks)
         self.stale = stale
-        if stale:
+        self.manual = manual
+        if manual:
+            self.setToolTip("Manual override — these chapters were hand-picked "
+                            "and will be written on Save (detection unchanged)")
+        elif stale:
             self.setToolTip("Preview from an OUTDATED profile — click Analyze to "
                             "refresh (blank-guard/peak features are off until you do)")
+        else:
+            self.setToolTip("")
         self.update()
 
     def paintEvent(self, _e):
@@ -174,17 +210,22 @@ class TimelineView(QWidget):
             p.drawLine(int(x), y0 + 3, int(x), y0 + h - 3)
             t += 300.0
 
-        # Stale profiles preview in muted colours; current ones are bright.
-        intro_c = QColor(70, 120, 84) if self.stale else QColor(90, 180, 110)
-        break_c = QColor(150, 110, 70) if self.stale else QColor(240, 150, 70)
+        # Manual overrides in cyan; stale previews muted; normal auto is orange.
+        if self.manual:
+            intro_c, break_c = QColor(90, 180, 110), QColor(90, 200, 220)
+        elif self.stale:
+            intro_c, break_c = QColor(70, 120, 84), QColor(150, 110, 70)
+        else:
+            intro_c, break_c = QColor(90, 180, 110), QColor(240, 150, 70)
         for tm, is_intro in self.marks:
             x = x0 + w * (tm / max(self.duration, 1e-9))
             p.setPen(QPen(intro_c if is_intro else break_c, 2))
             p.drawLine(int(x), y0 + 1, int(x), y0 + h - 1)
 
-        if self.stale:
-            p.setPen(QColor(210, 170, 90))
-            p.drawText(r.adjusted(0, 0, -4, 0), Qt.AlignRight | Qt.AlignVCenter, "outdated")
+        tag = "manual" if self.manual else ("outdated" if self.stale else "")
+        if tag:
+            p.setPen(QColor(120, 200, 220) if self.manual else QColor(210, 170, 90))
+            p.drawText(r.adjusted(0, 0, -4, 0), Qt.AlignRight | Qt.AlignVCenter, tag)
 
     def mouseMoveEvent(self, e):
         if self.duration > 0 and self.marks is not None:
@@ -269,7 +310,7 @@ class SaveWorker(QThread):
 
     def __init__(self, items, cfg, embed, cache):
         super().__init__()
-        self.items = list(items)       # list[(path, Signals, status)]
+        self.items = list(items)       # list[(path, Signals, status, override|None)]
         self.cfg = cfg
         self.embed = embed
         self.cache = cache
@@ -278,10 +319,13 @@ class SaveWorker(QThread):
         n = len(self.items)
         written = 0
         mkv_missing = False
-        for i, (path, sig, status) in enumerate(self.items):
+        for i, (path, sig, status, override) in enumerate(self.items):
             self.progress.emit(i, n, os.path.basename(path))
             try:
-                breaks, _, _ = detect_to_target(sig, self.cfg)
+                if override is not None:
+                    breaks = _manual_breaks(override, self.cfg)
+                else:
+                    breaks, _, _ = detect_to_target(sig, self.cfg)
                 paths = write_sidecars(path, breaks)
                 if self.embed and path.lower().endswith(".mkv"):
                     try:
@@ -372,6 +416,110 @@ class DiagnoseDialog(QDialog):
         self._copied.setText("copied to clipboard")
 
 
+class OverrideDialog(QDialog):
+    """Hand-pick a file's chapters from its candidate moments. The rows already
+    chosen by detection are pre-checked; the user can tick/untick any, or add a
+    custom timestamp. Detection settings are never touched."""
+
+    def __init__(self, title, rows, checked_times, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Override chapters — {title}")
+        self.resize(560, 640)
+        self.result_times = None   # list on Apply
+        self.cleared = False       # True if "use auto" chosen
+        self._boxes: list[tuple[QCheckBox, float]] = []
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel(
+            "Tick the timestamps to use as this file's chapters.\n"
+            "Detection settings are unchanged — this overrides only this file."))
+
+        cont = QWidget()
+        self._list = QVBoxLayout(cont)
+        self._list.setSpacing(2)
+        for r in rows:
+            self._add_box(r["time"], self._fmt_row(r),
+                          checked=any(abs(r["time"] - ct) < 1.0 for ct in checked_times))
+        # any pre-checked times not present as candidate rows (e.g. an odd auto
+        # break) still need a row so they stay checked
+        shown = {t for _, t in self._boxes}
+        for ct in sorted(checked_times):
+            if not any(abs(ct - s) < 1.0 for s in shown):
+                self._add_box(ct, f"{_hms(ct)}   (current chapter)", checked=True)
+        self._list.addStretch(1)
+        sc = QScrollArea()
+        sc.setWidgetResizable(True)
+        sc.setWidget(cont)
+        lay.addWidget(sc, 1)
+
+        crow = QHBoxLayout()
+        self.custom = QLineEdit()
+        self.custom.setPlaceholderText("H:MM:SS")
+        addb = QPushButton("Add time")
+        addb.clicked.connect(self._add_custom)
+        crow.addWidget(QLabel("Add custom:"))
+        crow.addWidget(self.custom, 1)
+        crow.addWidget(addb)
+        lay.addLayout(crow)
+
+        btns = QHBoxLayout()
+        clearb = QPushButton("Clear override (use auto)")
+        clearb.clicked.connect(self._clear)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        apply = QPushButton("Apply")
+        apply.setDefault(True)
+        apply.clicked.connect(self._apply)
+        btns.addWidget(clearb)
+        btns.addStretch(1)
+        btns.addWidget(cancel)
+        btns.addWidget(apply)
+        lay.addLayout(btns)
+
+    @staticmethod
+    def _fmt_row(r):
+        peak = f" peak={r['peak']:.0f}" if r["peak"] is not None else ""
+        rms = f" rms={r['rms']:.0f}dB" if r["rms"] is not None else ""
+        tags = []
+        if r["keep"]:
+            tags.append("auto-kept")
+        if r["dark"]:
+            tags.append("dark")
+        if r["quiet"]:
+            tags.append("quiet")
+        tagtxt = f"   [{', '.join(tags)}]" if tags else ""
+        return f"{_hms(r['time']):>8}   luma={r['luma']:.0f}{peak}{rms}{tagtxt}"
+
+    def _add_box(self, t, label, checked):
+        cb = QCheckBox(label)
+        cb.setChecked(checked)
+        n = self._list.count()
+        if n > 0 and self._list.itemAt(n - 1).spacerItem() is not None:
+            self._list.insertWidget(n - 1, cb)   # keep trailing stretch last
+        else:
+            self._list.addWidget(cb)
+        self._boxes.append((cb, float(t)))
+
+    def _add_custom(self):
+        t = _parse_time(self.custom.text())
+        if t is None:
+            return
+        if any(abs(t - bt) < 1.0 for _, bt in self._boxes):
+            self.custom.clear()
+            return
+        self._add_box(t, f"{_hms(t)}   (custom)", checked=True)
+        self.custom.clear()
+
+    def _apply(self):
+        self.result_times = sorted(t for cb, t in self._boxes if cb.isChecked())
+        self.accept()
+
+    def _clear(self):
+        self.cleared = True
+        self.result_times = []
+        self.accept()
+
+
 # --------------------------------------------------------------------------- #
 #  main window
 # --------------------------------------------------------------------------- #
@@ -390,6 +538,7 @@ class MainWindow(QMainWindow):
             self.exts |= {e if e.startswith(".") else "." + e for e in args.ext}
         self.signals: dict[str, object] = {}   # path -> Signals | None
         self.file_status: dict[str, str] = {}  # path -> missing|current|stale
+        self.overrides: dict[str, list] = {}   # path -> hand-picked chapter times
         self.rows: dict[str, dict] = {}         # path -> {name,count,timeline}
         self.floats: dict[str, FloatControl] = {}
         self.checks: dict[str, QCheckBox] = {}
@@ -687,6 +836,15 @@ class MainWindow(QMainWindow):
         row = self.rows.get(path)
         if row is None:
             return
+        cfg = cfg or self._cfg()
+        # manual override wins over both auto detection and stale styling
+        if path in self.overrides and sig is not None:
+            breaks = _manual_breaks(self.overrides[path], cfg)
+            row["timeline"].set_data(sig.duration, [(b.time, b.is_intro) for b in breaks],
+                                     manual=True)
+            row["count"].setText(str(sum(1 for b in breaks if not b.is_intro)))
+            row["name"].setStyleSheet("color:#6db3d6;")
+            return
         stale = self.file_status.get(path) == "stale"
         # amber filename for outdated profiles, plain otherwise
         row["name"].setStyleSheet("color:#d2aa5a;" if stale else "")
@@ -723,12 +881,44 @@ class MainWindow(QMainWindow):
     def _row_menu(self, path, widget, pos):
         menu = QMenu(self)
         act_diag = menu.addAction("Diagnose…")
+        act_over = menu.addAction("Override chapters…")
+        if path in self.overrides:
+            act_clear = menu.addAction("Clear override (use auto)")
+        else:
+            act_clear = None
         act_re = menu.addAction("Re-analyze this file")
         chosen = menu.exec(widget.mapToGlobal(pos))
         if chosen == act_diag:
             self._diagnose(path)
+        elif chosen == act_over:
+            self._override(path)
+        elif act_clear is not None and chosen == act_clear:
+            self.overrides.pop(path, None)
+            self._update_row(path, self.signals.get(path))
+            self._update_status()
         elif chosen == act_re:
             self._reanalyze_one(path)
+
+    def _override(self, path):
+        sig = self.signals.get(path)
+        if sig is None:
+            self.status.setText("Analyze this file first, then override its chapters.")
+            return
+        cfg = self._cfg()
+        rows = candidate_moments(sig, cfg)
+        if path in self.overrides:
+            checked = set(self.overrides[path])
+        else:
+            breaks, _, _ = detect_to_target(sig, cfg)
+            checked = {b.time for b in breaks if not b.is_intro}
+        dlg = OverrideDialog(os.path.basename(path), rows, checked, self)
+        if dlg.exec() == QDialog.Accepted:
+            if dlg.cleared:
+                self.overrides.pop(path, None)
+            else:
+                self.overrides[path] = list(dlg.result_times)
+            self._update_row(path, sig)
+            self._update_status()
 
     def _diagnose(self, path):
         sig = self.signals.get(path)
@@ -825,7 +1015,7 @@ class MainWindow(QMainWindow):
     def _save(self):
         if self._worker is not None:
             return
-        items = [(p, s, self.file_status.get(p, "current"))
+        items = [(p, s, self.file_status.get(p, "current"), self.overrides.get(p))
                  for p, s in self.signals.items() if s is not None]
         if not items:
             self.status.setText("Nothing to save — analyze some files first.")
