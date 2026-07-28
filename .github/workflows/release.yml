@@ -1,0 +1,57 @@
+name: Build Windows release
+
+# Builds the Windows exe with PyInstaller. On a version tag (e.g. v0.1.0) it also
+# publishes a GitHub Release with the exe attached. You can also run it manually
+# from the Actions tab to get a downloadable build artifact without releasing.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # needed to create the Release and upload the exe
+
+jobs:
+  windows-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ".[gui]" pyinstaller
+
+      - name: Build chaptermark.exe
+        run: |
+          pyinstaller --onefile --noconfirm --clean --name chaptermark --console --exclude-module tkinter --exclude-module PyQt5 --exclude-module PyQt6 run_chaptermark.py
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaptermark-windows
+          path: dist/chaptermark.exe
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/chaptermark.exe
+          generate_release_notes: true
+          body: |
+            ## chaptermark for Windows
+
+            Download **chaptermark.exe** below. Double-click it to open the graphical
+            tuner, or run it from a terminal with the usual flags to use the CLI
+            (e.g. `chaptermark.exe "D:\Shows\My Show" --embed`).
+
+            **Requires ffmpeg.** Install it from https://ffmpeg.org/download.html and
+            add it to your PATH, or simply drop `ffmpeg.exe` and `ffprobe.exe` in the
+            same folder as `chaptermark.exe`. To write chapters directly into MKVs
+            (the Embed option / `--embed`), also install MKVToolNix
+            (https://mkvtoolnix.download/) or drop `mkvpropedit.exe` beside the app.

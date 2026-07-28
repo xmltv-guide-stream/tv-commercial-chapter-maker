@@ -12,12 +12,12 @@ element in place -- no re-encode, no remux, near-instant even on huge files.
 
 from __future__ import annotations
 
-import shutil
 import subprocess
 from pathlib import Path
 from xml.sax.saxutils import escape
 
 from .detect import Break
+from .probe import find_tool
 
 
 def _fmt_ts(seconds: float) -> str:
@@ -102,11 +102,12 @@ class MkvpropeditNotFound(RuntimeError):
 
 def embed_chapters(video_path: str, xml_path: str) -> None:
     """Embed chapters into the MKV in place via mkvpropedit (no re-encode)."""
-    tool = shutil.which("mkvpropedit")
+    tool = find_tool("mkvpropedit")
     if not tool:
         raise MkvpropeditNotFound(
             "mkvpropedit not found. Install MKVToolNix "
-            "(https://mkvtoolnix.download/) to embed chapters into MKV files. "
+            "(https://mkvtoolnix.download/) — or place mkvpropedit.exe next to "
+            "this program — to embed chapters into MKV files. "
             "The sidecar .chapters.xml/.txt files were still written."
         )
     subprocess.run(

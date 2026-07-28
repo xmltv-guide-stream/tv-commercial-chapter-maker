@@ -437,16 +437,23 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
 
     # GUI mode: hand off to the (optional) PySide6 tuner. Imported lazily so the
-    # CLI has no GUI dependency and its behaviour is entirely unchanged.
-    if args.gui:
+    # CLI has no GUI dependency and its behaviour is entirely unchanged. A bare
+    # launch (no folder, no other action — e.g. double-clicking the packaged
+    # exe) opens the GUI too, so non-technical users get a window.
+    bare = args.folder is None and not args.clear_cache
+    if args.gui or bare:
         try:
             from . import gui
         except ImportError as e:
-            print(f"The GUI needs PySide6, which isn't installed.\n"
-                  f"  Install it with:  pip install PySide6\n  ({e})", file=sys.stderr)
-            return 4
-        start = Path(args.folder).expanduser() if args.folder else None
-        return gui.launch(start, build_config(args), args)
+            if args.gui:
+                print(f"The GUI needs PySide6, which isn't installed.\n"
+                      f"  Install it with:  pip install PySide6\n  ({e})", file=sys.stderr)
+                return 4
+            # bare launch without the GUI available -> fall through to the
+            # normal "folder required" message below
+        else:
+            start = Path(args.folder).expanduser() if args.folder else None
+            return gui.launch(start, build_config(args), args)
 
     if args.folder is None:
         print("error: a folder is required (or pass --gui to open the tuner)", file=sys.stderr)
