@@ -27,8 +27,10 @@ turns a video file into two numpy arrays of (timestamp, value).
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
+import sys
 import threading
 from dataclasses import dataclass
 
@@ -39,12 +41,37 @@ class FfmpegNotFound(RuntimeError):
     pass
 
 
+def _app_dir() -> str | None:
+    """Directory to look for sibling tools next to a packaged (PyInstaller) exe."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return None
+
+
+def find_tool(name: str) -> str | None:
+    """Locate an external tool: PATH first, then alongside a frozen exe (so a
+    user can just drop ffmpeg.exe / ffprobe.exe / mkvpropedit.exe next to the
+    downloaded program). Returns the full path, or None."""
+    found = shutil.which(name)
+    if found:
+        return found
+    d = _app_dir()
+    if d:
+        for cand in (os.path.join(d, name + ".exe"), os.path.join(d, name),
+                     os.path.join(d, "ffmpeg", name + ".exe"),
+                     os.path.join(d, "bin", name + ".exe")):
+            if os.path.isfile(cand):
+                return cand
+    return None
+
+
 def _require(tool: str) -> str:
-    path = shutil.which(tool)
+    path = find_tool(tool)
     if not path:
         raise FfmpegNotFound(
-            f"'{tool}' was not found on your PATH. Install ffmpeg "
-            f"(which includes {tool}) and make sure it's on PATH."
+            f"'{tool}' was not found. Install ffmpeg (which includes ffmpeg and "
+            f"ffprobe) from https://ffmpeg.org/download.html and add it to your "
+            f"PATH — or place ffmpeg.exe and ffprobe.exe next to this program."
         )
     return path
 

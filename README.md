@@ -32,7 +32,19 @@ recognized as a break. Disable with `--no-logo-detect` if needed.
   for `--embed`, to write chapters into the MKV in place. Without it, sidecar
   chapter files are still written.
 
-## Install
+## Download (Windows exe)
+
+Don't want to install Python? Grab **chaptermark.exe** from the
+[Releases page](../../releases). Double-click it to open the graphical tuner, or
+run it from a terminal with the usual flags to use the CLI.
+
+It still needs **ffmpeg**: install it from https://ffmpeg.org/download.html and
+add it to your PATH, or just drop `ffmpeg.exe` and `ffprobe.exe` in the same
+folder as `chaptermark.exe`. For the Embed option (writing chapters into MKVs),
+also install [MKVToolNix](https://mkvtoolnix.download/) or drop `mkvpropedit.exe`
+beside the app.
+
+## Install (from source)
 
 ```bash
 # From the repo root — installs the `chaptermark` command and its numpy dependency:
@@ -231,4 +243,29 @@ chaptermaker/
   cli.py           argparse CLI, batch runner, and the --diagnose report
   gui.py           optional PySide6 tuner (--gui): live timelines, right-click
                    Diagnose / Override / Re-analyze
+run_chaptermark.py           PyInstaller entry point for the packaged exe
+.github/workflows/release.yml  builds the Windows exe + publishes a Release
+```
+
+## Building / releasing the Windows exe
+
+A GitHub Actions workflow (`.github/workflows/release.yml`) builds the exe with
+PyInstaller. To cut a release, push a version tag:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+That triggers a Windows build and publishes a GitHub Release with
+`chaptermark.exe` attached and auto-generated notes. You can also run the
+workflow manually from the **Actions** tab to get a downloadable build artifact
+without publishing a release.
+
+To build it yourself locally (on Windows, with the repo checked out):
+
+```bash
+pip install ".[gui]" pyinstaller
+pyinstaller --onefile --console --name chaptermark run_chaptermark.py
+# -> dist\chaptermark.exe
 ```
