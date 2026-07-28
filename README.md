@@ -220,9 +220,15 @@ python -m chaptermaker "D:\Tapes" --clear-cache
 
 ```
 chaptermaker/
-  probe.py         ffmpeg/ffprobe -> per-file brightness & loudness time series
-  profilecache.py  gzip-JSON cache of profiles (resume-safe)
+  __init__.py      package metadata (version)
+  __main__.py      entry point for `python -m chaptermaker`
+  probe.py         ffmpeg/ffprobe -> per-file luma (mean + peak), loudness, and
+                   persistent-logo mask (the decode passes)
+  profilecache.py  gzip-JSON cache of profiles (resume-safe, versioned, with
+                   source-path recovery + re-key on embed)
   detect.py        adaptive thresholds + break-region logic (the core)
   chapters.py      OGM/XML sidecar writers + mkvpropedit embedding
-  cli.py           argparse CLI / batch runner
+  cli.py           argparse CLI, batch runner, and the --diagnose report
+  gui.py           optional PySide6 tuner (--gui): live timelines, right-click
+                   Diagnose / Override / Re-analyze
 ```
