@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import threading
 from dataclasses import dataclass
 
 import numpy as np
@@ -148,15 +149,43 @@ def _read_exact(stream, n: int) -> bytes:
 
 def _popen(args: list[str]):
     ffmpeg = _require("ffmpeg")
-    return subprocess.Popen(
+    proc = subprocess.Popen(
         [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", *args],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
+    # Drain stderr continuously on a background thread. Otherwise a chatty
+    # decoder (e.g. a problematic AVI spewing warnings) can fill the ~64KB stderr
+    # pipe buffer and block ffmpeg's writes while we're blocked reading stdout —
+    # a classic deadlock that looks like the analyze "hanging" on one file. The
+    # text is kept so _finish can still report it on failure.
+    proc._stderr_buf: list[bytes] = []
+
+    def _drain(p=proc):
+        try:
+            while True:
+                chunk = p.stderr.read(65536)
+                if not chunk:
+                    break
+                p._stderr_buf.append(chunk)
+        except Exception:
+            pass
+
+    th = threading.Thread(target=_drain, daemon=True)
+    th.start()
+    proc._stderr_thread = th
+    return proc
+
+
+def _drain_stderr(proc) -> bytes:
+    th = getattr(proc, "_stderr_thread", None)
+    if th is not None:
+        th.join(timeout=2.0)
+    return b"".join(getattr(proc, "_stderr_buf", []))
 
 
 def _finish(proc, produced: bool, what: str) -> None:
-    err = proc.stderr.read() if proc.stderr else b""
     ret = proc.wait()
+    err = _drain_stderr(proc)
     if ret != 0 and not produced:
         msg = err.decode("utf-8", "replace").strip()[:500]
         raise RuntimeError(f"ffmpeg {what} decode failed (exit {ret}): {msg}")
@@ -214,11 +243,10 @@ def _logo_mask(path: str, scale_w: int, scale_h: int):
         except Exception:
             pass
         try:
-            if proc.stderr:
-                proc.stderr.read()
             proc.wait()
         except Exception:
             pass
+        _drain_stderr(proc)  # let the background reader finish (owns proc.stderr)
     if len(frames) < _LOGO_MIN_KEYFRAMES:
         return None, 0.0
     # low percentile per pixel: bright even here => bright in >= (100-pctl)% of frames
