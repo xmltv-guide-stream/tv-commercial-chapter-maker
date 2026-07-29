@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
@@ -260,7 +261,8 @@ class ProbeWorker(QThread):
     failed = Signal(str, str)          # path, message
     finishedAll = Signal()
 
-    def __init__(self, paths, cache, video_fps, audio_window, mode, logo_detect=True):
+    def __init__(self, paths, cache, video_fps, audio_window, mode,
+                 logo_detect=True, jobs=1, hwaccel=None):
         super().__init__()
         self.paths = list(paths)
         self.cache = cache
@@ -268,35 +270,54 @@ class ProbeWorker(QThread):
         self.audio_window = audio_window
         self.mode = mode
         self.logo_detect = logo_detect
+        self.jobs = max(1, int(jobs))
+        self.hwaccel = hwaccel
         self._stop = False
 
     def stop(self):
         self._stop = True
 
+    def _decode(self, path):
+        sig = probe_file(path, video_fps=self.video_fps, audio_window=self.audio_window,
+                         logo_detect=self.logo_detect, hwaccel=self.hwaccel)
+        self.cache.put(path, sig)
+        return sig
+
     def run(self):
         n = len(self.paths)
-        for i, path in enumerate(self.paths):
+        done = 0
+        needs_decode = []
+        # First, resolve everything that doesn't need decoding (cache reads are
+        # cheap) and queue the rest for the parallel pool.
+        for path in self.paths:
             if self._stop:
                 break
-            self.progress.emit(i, n, os.path.basename(path))
-            try:
-                if self.mode == "reprofile":
-                    sig, status = None, "missing"
-                else:
-                    sig, status = self.cache.get_any(path)
-                # 'analyze' refreshes anything not current (missing OR stale);
-                # 'reprofile' refreshes everything; 'cache' only reads.
-                need = (self.mode == "reprofile"
-                        or (self.mode == "analyze" and status != "current"))
-                if need:
-                    sig = probe_file(path, video_fps=self.video_fps,
-                                     audio_window=self.audio_window,
-                                     logo_detect=self.logo_detect)
-                    self.cache.put(path, sig)
-                    status = "current"
-                self.fileReady.emit(path, sig, status)
-            except Exception as e:  # keep going on a bad file
-                self.failed.emit(path, str(e))
+            if self.mode == "reprofile":
+                needs_decode.append(path)
+                continue
+            sig, status = self.cache.get_any(path)
+            if self.mode == "analyze" and status != "current":
+                needs_decode.append(path)
+                continue
+            done += 1
+            self.progress.emit(done, n, os.path.basename(path))
+            self.fileReady.emit(path, sig, status)
+
+        # Decode the rest concurrently. The pool workers only decode + cache;
+        # signals are emitted here on the worker thread (not the pool threads).
+        if needs_decode and not self._stop:
+            with ThreadPoolExecutor(max_workers=self.jobs) as ex:
+                futures = {ex.submit(self._decode, p): p for p in needs_decode}
+                for fut in as_completed(futures):
+                    path = futures[fut]
+                    if self._stop:
+                        break
+                    done += 1
+                    self.progress.emit(done, n, os.path.basename(path))
+                    try:
+                        self.fileReady.emit(path, fut.result(), "current")
+                    except Exception as e:
+                        self.failed.emit(path, str(e))
         self.progress.emit(n, n, "")
         self.finishedAll.emit()
 
@@ -356,7 +377,8 @@ class DiagnoseWorker(QThread):
     done = Signal(str, str, object)    # path, report text, Signals used
     failed = Signal(str, str)
 
-    def __init__(self, path, sig, cache, cfg, video_fps, audio_window, logo_detect=True):
+    def __init__(self, path, sig, cache, cfg, video_fps, audio_window,
+                 logo_detect=True, hwaccel=None):
         super().__init__()
         self.path = path
         self.sig = sig
@@ -365,6 +387,7 @@ class DiagnoseWorker(QThread):
         self.video_fps = video_fps
         self.audio_window = audio_window
         self.logo_detect = logo_detect
+        self.hwaccel = hwaccel
 
     def run(self):
         try:
@@ -372,7 +395,7 @@ class DiagnoseWorker(QThread):
             if sig is None:
                 sig = probe_file(self.path, video_fps=self.video_fps,
                                  audio_window=self.audio_window,
-                                 logo_detect=self.logo_detect)
+                                 logo_detect=self.logo_detect, hwaccel=self.hwaccel)
                 self.cache.put(self.path, sig)
             text = format_diagnosis(os.path.basename(self.path), sig, self.cfg)
             self.done.emit(self.path, text, sig)
@@ -608,6 +631,10 @@ class MainWindow(QMainWindow):
         self._float(g, "video_fps", "video fps", 1.0, 30.0, 1.0, live=False)
         self._float(g, "audio_window", "audio window (s)", 0.02, 0.5, 0.01, live=False)
         self._check(g, "logo_detect", "detect + ignore channel logo/bug", live=False)
+        # runtime speed knobs — don't invalidate the cache, so live=None
+        self._float(g, "jobs", "parallel jobs", 1, 16, 1, integer=True, live=None)
+        self._combo(g, "hwaccel", "GPU decode",
+                    ["none", "auto", "cuda", "qsv", "d3d11va", "videotoolbox"], live=None)
 
         g = self._group("Output", cl)
         self._check(g, "embed", "embed chapters into MKV on Save", live=False)
@@ -678,7 +705,8 @@ class MainWindow(QMainWindow):
                integer=False, live=True):
         c = FloatControl(label, lo, hi, step, value if value is not None else lo, integer)
         self.floats[key] = c
-        c.changed.connect(self._on_live_change if live else self._on_sampling_change)
+        if live is not None:   # None = a runtime setting that changes nothing to recompute
+            c.changed.connect(self._on_live_change if live else self._on_sampling_change)
         layout.addWidget(c)
 
     def _check(self, layout, key, label, live=True, on_toggle=None):
@@ -692,7 +720,7 @@ class MainWindow(QMainWindow):
             cb.toggled.connect(self._on_sampling_change)
         layout.addWidget(cb)
 
-    def _combo(self, layout, key, label, options):
+    def _combo(self, layout, key, label, options, live=True):
         row = QWidget()
         rl = QHBoxLayout(row)
         rl.setContentsMargins(0, 0, 0, 0)
@@ -701,7 +729,8 @@ class MainWindow(QMainWindow):
         cb = QComboBox()
         cb.addItems(options)
         self.combos[key] = cb
-        cb.currentTextChanged.connect(self._on_live_change)
+        if live is not None:
+            cb.currentTextChanged.connect(self._on_live_change)
         rl.addWidget(name)
         rl.addWidget(cb, 1)
         layout.addWidget(row)
@@ -720,10 +749,12 @@ class MainWindow(QMainWindow):
             "min_chapters": cfg.min_chapters, "min_duration_floor": cfg.min_duration_floor,
             "video_fps": getattr(args, "video_fps", 12.0),
             "audio_window": getattr(args, "audio_window", 0.1),
+            "jobs": getattr(args, "jobs", min(4, os.cpu_count() or 1)),
         }
         for k, v in fv.items():
             if k in self.floats:
                 self.floats[k].set_value(v)
+        self.combos["hwaccel"].setCurrentText(getattr(args, "hwaccel", "none"))
         for k, v in {
             "add_intro": cfg.add_intro, "near_miss": cfg.near_miss,
             "ignore_audio": cfg.ignore_audio, "audio_fallback": cfg.audio_fallback,
@@ -922,10 +953,12 @@ class MainWindow(QMainWindow):
 
     def _diagnose(self, path):
         sig = self.signals.get(path)
+        hw = self.combos["hwaccel"].currentText()
         w = DiagnoseWorker(path, sig, self.cache, self._cfg(),
                            self.floats["video_fps"].value(),
                            self.floats["audio_window"].value(),
-                           self.checks["logo_detect"].isChecked())
+                           self.checks["logo_detect"].isChecked(),
+                           hwaccel=(None if hw == "none" else hw))
         self._diag_workers.append(w)
         w.done.connect(self._on_diag_done)
         w.failed.connect(self._on_file_failed)
@@ -963,10 +996,13 @@ class MainWindow(QMainWindow):
     def _start_worker(self, files, mode):
         if self._worker is not None:
             return
+        hw = self.combos["hwaccel"].currentText()
         w = ProbeWorker(files, self.cache,
                         self.floats["video_fps"].value(),
                         self.floats["audio_window"].value(), mode,
-                        self.checks["logo_detect"].isChecked())
+                        self.checks["logo_detect"].isChecked(),
+                        jobs=int(self.floats["jobs"].value()),
+                        hwaccel=(None if hw == "none" else hw))
         self._worker = w
         w.progress.connect(self._on_progress)
         w.fileReady.connect(self._on_file_ready)

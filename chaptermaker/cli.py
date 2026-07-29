@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -61,17 +63,59 @@ def build_config(args) -> DetectConfig:
     )
 
 
+def _hwaccel_of(args):
+    hw = getattr(args, "hwaccel", "none")
+    return None if hw in (None, "none") else hw
+
+
 def _get_signals(path: Path, cache: ProfileCache, args):
     sig = None if args.reprofile else cache.get(str(path))
     if sig is None:
         if args.verbose:
             print(f"  profiling (decoding)…", flush=True)
         sig = probe_file(str(path), video_fps=args.video_fps, audio_window=args.audio_window,
-                         logo_detect=getattr(args, "logo_detect", True))
+                         logo_detect=getattr(args, "logo_detect", True),
+                         hwaccel=_hwaccel_of(args))
         cache.put(str(path), sig)
     elif args.verbose:
         print("  using cached profile", flush=True)
     return sig
+
+
+def _prime_cache(videos, cache: ProfileCache, args) -> None:
+    """Decode the files that still need profiling *in parallel*, filling the
+    cache, so the subsequent (serial, ordered) processing loop is all cache
+    hits. The expensive part — the ffmpeg decode — is what runs concurrently;
+    detection and writing stay serial for clean output. No-op when --jobs<=1."""
+    jobs = max(1, getattr(args, "jobs", 1))
+    if jobs <= 1:
+        return
+    todo = [p for p in videos if args.reprofile or cache.get(str(p)) is None]
+    if len(todo) <= 1:
+        return
+    print(f"Profiling {len(todo)} file(s) with {jobs} parallel workers…", flush=True)
+
+    def _one(p):
+        return p, probe_file(
+            str(p), video_fps=args.video_fps, audio_window=args.audio_window,
+            logo_detect=getattr(args, "logo_detect", True), hwaccel=_hwaccel_of(args))
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=jobs) as ex:
+        futures = [ex.submit(_one, p) for p in todo]
+        for fut in as_completed(futures):
+            done += 1
+            try:
+                p, sig = fut.result()
+                cache.put(str(p), sig)
+                print(f"  [{done}/{len(todo)}] {p.name}", flush=True)
+            except FfmpegNotFound as e:
+                print(f"\n{e}", file=sys.stderr)
+                break  # ffmpeg missing everywhere; let the serial loop report it
+            except Exception as e:
+                print(f"  ! error profiling: {e}", file=sys.stderr)
+    # Cache is now warm; stop the serial loop from re-decoding under --reprofile.
+    args.reprofile = False
 
 
 def format_diagnosis(rel: str, sig, cfg: DetectConfig) -> str:
@@ -416,6 +460,11 @@ def build_parser() -> argparse.ArgumentParser:
                           help="Audio RMS window length in seconds")
     sampling.add_argument("--no-logo-detect", dest="logo_detect", action="store_false", default=True,
                           help="Disable detection of a persistent channel logo/bug. Normally a static bright overlay (common on DSR/broadcast rips) is found and excluded from the peak so a fade behind it is still recognized as blank")
+    sampling.add_argument("-j", "--jobs", type=int, default=min(4, os.cpu_count() or 1),
+                          help="Profile (decode) this many files in parallel. Higher = faster on multi-core CPUs; the first pass over a big library is the main beneficiary. Default: min(4, CPU cores)")
+    sampling.add_argument("--hwaccel", default="none",
+                          choices=["none", "auto", "cuda", "qsv", "d3d11va", "dxva2", "videotoolbox", "vaapi"],
+                          help="Offload video decoding to a GPU/hardware decoder (falls back to CPU if it fails). Mostly helps HD/modern-codec sources; little to no benefit on low-res SDTV/VHS. Default: none")
 
     out = p.add_argument_group("output")
     out.add_argument("--embed", action="store_true",
@@ -486,6 +535,13 @@ def main(argv=None) -> int:
         return 0
 
     cfg = build_config(args)
+
+    # Warm the cache in parallel (the expensive decode) before the serial loops.
+    try:
+        _prime_cache(videos, cache, args)
+    except KeyboardInterrupt:
+        print("\nInterrupted — cached profiles are kept; re-run to resume.", file=sys.stderr)
+        return 130
 
     # Diagnose mode: print detailed reports and exit, writing nothing.
     if args.diagnose:
