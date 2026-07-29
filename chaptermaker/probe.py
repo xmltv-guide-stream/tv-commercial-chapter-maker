@@ -243,15 +243,16 @@ _LOGO_MIN_KEYFRAMES = 8   # too few keyframes -> not enough evidence, skip
 _LOGO_MAX_KEYFRAMES = 1500  # cap frames held in memory for the percentile
 
 
-def _logo_mask(path: str, scale_w: int, scale_h: int):
+def _logo_mask(path: str, scale_w: int, scale_h: int, hwaccel: str | None = None):
     """Return (flat bool mask of overlay pixels, fraction) or (None, 0.0).
 
     Decodes only keyframes (`-skip_frame nokey`) so this extra pass is cheap.
     Never raises for decode issues — a failure just means "no logo detected",
     leaving peak computation exactly as it was."""
     frame_bytes = scale_w * scale_h
+    hw = ["-hwaccel", hwaccel] if hwaccel else []
     proc = _popen([
-        "-skip_frame", "nokey", "-i", path, "-map", "0:v:0",
+        "-skip_frame", "nokey", *hw, "-i", path, "-map", "0:v:0",
         "-an", "-sn", "-dn", "-vsync", "0",
         "-vf", f"scale={scale_w}:{scale_h}", "-pix_fmt", "gray", "-f", "rawvideo", "-",
     ])
@@ -287,7 +288,7 @@ def _logo_mask(path: str, scale_w: int, scale_h: int):
 
 
 def _sample_video(path: str, fps: float, scale_w: int, scale_h: int,
-                  logo_mask=None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+                  logo_mask=None, hwaccel: str | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return (times, luma, peak), each 0..255, from raw grayscale frames at `fps`.
 
     luma = frame mean (scale-invariant, so cheap to compute at any size); peak =
@@ -300,8 +301,9 @@ def _sample_video(path: str, fps: float, scale_w: int, scale_h: int,
     the peak so a channel logo can't hold the peak up during a real fade."""
     frame_bytes = scale_w * scale_h
     keep = ~logo_mask if logo_mask is not None else None
+    hw = ["-hwaccel", hwaccel] if hwaccel else []
     proc = _popen([
-        "-i", path, "-map", "0:v:0", "-an", "-sn", "-dn",
+        *hw, "-i", path, "-map", "0:v:0", "-an", "-sn", "-dn",
         "-vf", f"fps={fps},scale={scale_w}:{scale_h}",
         "-pix_fmt", "gray", "-f", "rawvideo", "-",
     ])
@@ -352,18 +354,30 @@ def probe_file(
     scale_w: int = 256,
     scale_h: int = 144,
     logo_detect: bool = True,
+    hwaccel: str | None = None,
 ) -> Signals:
-    """Profile one file into brightness and loudness time series."""
+    """Profile one file into brightness and loudness time series.
+
+    `hwaccel` (e.g. 'cuda', 'qsv', 'd3d11va', 'auto') offloads video decoding to
+    a GPU/hardware decoder; the main video pass falls back to CPU if it fails."""
     duration = probe_duration(path)
     logo_mask, logo_frac = (None, 0.0)
     if logo_detect:
         try:
-            logo_mask, logo_frac = _logo_mask(path, scale_w, scale_h)
+            logo_mask, logo_frac = _logo_mask(path, scale_w, scale_h, hwaccel=hwaccel)
         except FfmpegNotFound:
             raise
         except Exception:
             logo_mask, logo_frac = None, 0.0   # never let logo detection break profiling
-    v_times, v_luma, v_peak = _sample_video(path, video_fps, scale_w, scale_h, logo_mask)
+    try:
+        v_times, v_luma, v_peak = _sample_video(
+            path, video_fps, scale_w, scale_h, logo_mask, hwaccel=hwaccel)
+    except RuntimeError:
+        if hwaccel:   # hardware decode failed -> retry on the CPU
+            v_times, v_luma, v_peak = _sample_video(
+                path, video_fps, scale_w, scale_h, logo_mask, hwaccel=None)
+        else:
+            raise
     has_audio = _has_audio_stream(path)
     if has_audio:
         a_times, a_rms = _sample_audio_rms(path, audio_window)

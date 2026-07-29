@@ -156,9 +156,26 @@ file's own floor, so the same settings travel across differently-degraded tapes.
 | `--min-duration-floor S` | Shortest gap the auto-escalation will accept — lower to catch very brief breaks (~0.1s) | `0.05` |
 | `--no-intro` | Don't force a chapter at 00:00 | off |
 
-Advanced sampling: `--video-fps` (brightness sample rate, default 8) and
+Advanced sampling: `--video-fps` (brightness sample rate, default 12) and
 `--audio-window` (audio RMS window seconds, default 0.1). Lower fps = faster
 scans on huge files.
+
+### Speed
+
+The one slow step is decoding each file the first time (it's cached after
+that). Two ways to speed up the initial pass over a big library:
+
+- `--jobs N` (`-j N`) — decode **N files in parallel**. Defaults to
+  `min(4, CPU cores)`. This is the biggest, safest win on a multi-core machine,
+  and helps every file regardless of format.
+- `--hwaccel MODE` — offload video decoding to a **GPU/hardware decoder**
+  (`cuda` for NVIDIA, `qsv` for Intel, `d3d11va` for generic Windows, or `auto`).
+  Falls back to CPU automatically if it fails. This mostly helps **HD /
+  modern-codec** sources (e.g. 1080p Blu-ray rips); on low-res SDTV/VHS the
+  per-frame transfer overhead means little or no gain, so leave it `none` there.
+
+Both are also exposed in the GUI's *Sampling* group (they don't invalidate the
+cache — changing them just affects the next decode).
 
 ### Typical tuning workflow
 
