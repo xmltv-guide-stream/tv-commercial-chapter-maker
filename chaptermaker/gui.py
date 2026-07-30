@@ -32,8 +32,8 @@ from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
     QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMenu,
-    QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSlider,
-    QSpinBox, QVBoxLayout, QWidget,
+    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
+    QSizePolicy, QSlider, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from .chapters import MkvpropeditNotFound, embed_chapters, write_sidecars
@@ -1184,6 +1184,25 @@ class MainWindow(QMainWindow):
             self.status.setText("Nothing to save — analyze some files first.")
             return
         embed = self.checks["embed"].isChecked()
+        # Embedding replaces a file's chapters wholesale. Warn before clobbering
+        # existing chapters when the user hasn't chosen an override for that file
+        # (sidecar-only saves don't touch the file, so no warning there).
+        if embed:
+            clobber = [p for (p, s, st, ov) in items
+                       if ov is None and self.existing.get(p)]
+            if clobber:
+                n = len(clobber)
+                btn = QMessageBox.warning(
+                    self, "Replace existing chapters?",
+                    f"{n} file(s) already have chapters embedded. Saving with "
+                    f"Embed on will REPLACE them with the detected chapters.\n\n"
+                    f"To keep a file's existing chapters, cancel and use "
+                    f"right-click → Override (they're pre-ticked there).\n\n"
+                    f"Replace the existing chapters in these {n} file(s)?",
+                    QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
+                if btn != QMessageBox.Yes:
+                    self.status.setText("Save cancelled — existing chapters kept.")
+                    return
         w = SaveWorker(items, self._cfg(), embed, self.cache)
         self._worker = w
         w.progress.connect(self._on_progress)
