@@ -149,6 +149,35 @@ def probe_duration(path: str) -> float:
         return 0.0
 
 
+def read_chapters(path: str) -> tuple[list[float], float]:
+    """Return (existing chapter start times in seconds, file duration in seconds)
+    from ffprobe — fast metadata read, no decoding. ([], 0.0) if none/on error."""
+    try:
+        ffprobe = _require("ffprobe")
+    except FfmpegNotFound:
+        return [], 0.0
+    try:
+        out = subprocess.run(
+            [ffprobe, "-v", "error", "-show_chapters",
+             "-show_entries", "format=duration", "-of", "json", path],
+            capture_output=True, text=True, timeout=30,
+        )
+        data = json.loads(out.stdout or "{}")
+    except Exception:
+        return [], 0.0
+    times: list[float] = []
+    for ch in data.get("chapters", []):
+        try:
+            times.append(float(ch["start_time"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    try:
+        dur = float(data.get("format", {}).get("duration") or 0.0)
+    except (TypeError, ValueError):
+        dur = 0.0
+    return sorted(times), dur
+
+
 def _has_audio_stream(path: str) -> bool:
     ffprobe = _require("ffprobe")
     out = subprocess.run(

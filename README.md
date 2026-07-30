@@ -105,7 +105,9 @@ pre-populate them. The recommended workflow:
 3. **Tune live.** Drag any slider or toggle any box — every file's timeline
    re-computes and redraws instantly, because detection runs on the cached
    signals (no re-decoding). Green tick = the 00:00 intro marker; orange tick =
-   a detected break; gridlines every 5 minutes.
+   a detected break; cyan tick = a manual override; **magenta tick = a chapter
+   already embedded in the file** (shown even before you analyze, until you
+   overwrite it with Save); gridlines every 5 minutes.
 4. **Save / Write.** Writes the sidecar `.chapters.xml`/`.txt` files with the
    current settings. If the **Embed** checkbox is ticked, it also embeds the
    chapters into each `.mkv` in place (needs mkvpropedit).
