@@ -31,7 +31,12 @@ CACHE_DIRNAME = ".chapterprofiles"
 #   4: peak excludes a detected persistent overlay (channel logo/bug)
 #   5: logo detected via low-percentile (was min) so a black intro/outro or a
 #      few dark scenes over the logo no longer hide it
-SIGNALS_VERSION = 5
+#   6: peak also excludes recurring corner overlays (rating bugs / brief bugs)
+#   7: recurring-corner detection moved to the dense video pass + segment-counted
+#      (keyframe-only was too sparse to catch brief fade bugs)
+#   8: overlay-eligible region widened from tight corner boxes to a 25% edge band
+#      (rating bugs are often inset from the exact corner)
+SIGNALS_VERSION = 8
 
 
 def _key(path: str) -> str:
