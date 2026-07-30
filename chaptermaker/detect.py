@@ -291,12 +291,15 @@ def detect(sig: Signals, cfg: DetectConfig) -> tuple[list[Break], Profile]:
                 score=0.0, is_intro=True,
             ))
 
-    if cfg.max_chapters is not None and len(breaks) > cfg.max_chapters:
-        # Keep the intro + strongest breaks, then re-sort by time.
+    # max_chapters caps the number of DETECTED breaks; the 00:00 intro is always
+    # kept and never counted — symmetric with --min-chapters, which likewise
+    # counts detected breaks only.
+    if cfg.max_chapters is not None and count_breaks(breaks) > cfg.max_chapters:
+        # Keep the intro + the strongest detected breaks, then re-sort by time.
         intro = [b for b in breaks if b.is_intro]
         rest = sorted((b for b in breaks if not b.is_intro),
                       key=lambda b: b.score, reverse=True)
-        keep = intro + rest[: max(0, cfg.max_chapters - len(intro))]
+        keep = intro + rest[: cfg.max_chapters]
         breaks = sorted(keep, key=lambda b: b.time)
 
     return breaks, prof

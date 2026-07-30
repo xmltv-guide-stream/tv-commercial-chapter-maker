@@ -134,10 +134,16 @@ def format_diagnosis(rel: str, sig, cfg: DetectConfig) -> str:
 
     p(f"=== DIAGNOSE: {rel} ===")
     p(f"duration={_fmt_clock(duration)}  mode={cfg.mode}  sensitivity={cfg.sensitivity}  "
-      f"min_duration={cfg.min_duration}s  min_gap={cfg.min_gap}s")
-    p(f"skip_start={cfg.skip_start}s  skip_end={cfg.skip_end}s  "
-      f"min_chapters={cfg.min_chapters}  blank_guard={'on' if cfg.blank_guard else 'off'}  "
-      f"ignore_audio={cfg.ignore_audio}")
+      f"mark_at={cfg.mark_at}  add_intro={cfg.add_intro}")
+    p(f"min_duration={cfg.min_duration}s  min_gap={cfg.min_gap}s  "
+      f"skip_start={cfg.skip_start}s  skip_end={cfg.skip_end}s")
+    p(f"min_chapters={cfg.min_chapters}  max_chapters={cfg.max_chapters}  "
+      f"min_dur_floor={cfg.min_duration_floor}s  grid_step={cfg.grid_step}s")
+    p(f"blank_guard={'on' if cfg.blank_guard else 'off'}  ignore_audio={cfg.ignore_audio}  "
+      f"audio_fallback={cfg.audio_fallback}  near_miss={cfg.near_miss} "
+      f"(deep={cfg.near_deep}, tol={cfg.near_tol})")
+    p(f"margins: black={cfg.black_margin}  quiet={cfg.quiet_margin}  bright={cfg.bright_margin}  "
+      f"peak_cap={cfg.peak_cap}  quiet_floor_trim={cfg.quiet_floor_trim}")
 
     # --- video ---
     L = sig.v_luma
