@@ -6,4 +6,4 @@ silent due to tape hiss), we *profile each file individually* to find its own
 "blackest black" and "quietest quiet", then set thresholds relative to that.
 """
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
