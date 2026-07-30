@@ -41,6 +41,15 @@ class FfmpegNotFound(RuntimeError):
     pass
 
 
+class ProbeCancelled(Exception):
+    """Raised when a caller's cancel Event fires mid-decode (see probe_file).
+    Deliberately NOT a RuntimeError so the CPU-fallback path doesn't swallow it."""
+
+
+def _cancelled(cancel) -> bool:
+    return cancel is not None and cancel.is_set()
+
+
 def _app_dir() -> str | None:
     """Directory to look for sibling tools next to a packaged (PyInstaller) exe."""
     if getattr(sys, "frozen", False):
@@ -243,7 +252,7 @@ _LOGO_MIN_KEYFRAMES = 8   # too few keyframes -> not enough evidence, skip
 _LOGO_MAX_KEYFRAMES = 1500  # cap frames held in memory for the percentile
 
 
-def _logo_mask(path: str, scale_w: int, scale_h: int, hwaccel: str | None = None):
+def _logo_mask(path: str, scale_w: int, scale_h: int, hwaccel: str | None = None, cancel=None):
     """Return (flat bool mask of overlay pixels, fraction) or (None, 0.0).
 
     Decodes only keyframes (`-skip_frame nokey`) so this extra pass is cheap.
@@ -259,10 +268,14 @@ def _logo_mask(path: str, scale_w: int, scale_h: int, hwaccel: str | None = None
     frames: list[np.ndarray] = []
     try:
         while len(frames) < _LOGO_MAX_KEYFRAMES:
+            if _cancelled(cancel):
+                raise ProbeCancelled()
             buf = _read_exact(proc.stdout, frame_bytes)
             if len(buf) < frame_bytes:
                 break
             frames.append(np.frombuffer(buf, dtype=np.uint8))
+    except ProbeCancelled:
+        raise
     except Exception:
         frames = []
     finally:
@@ -288,7 +301,7 @@ def _logo_mask(path: str, scale_w: int, scale_h: int, hwaccel: str | None = None
 
 
 def _sample_video(path: str, fps: float, scale_w: int, scale_h: int,
-                  logo_mask=None, hwaccel: str | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+                  logo_mask=None, hwaccel: str | None = None, cancel=None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return (times, luma, peak), each 0..255, from raw grayscale frames at `fps`.
 
     luma = frame mean (scale-invariant, so cheap to compute at any size); peak =
@@ -310,6 +323,10 @@ def _sample_video(path: str, fps: float, scale_w: int, scale_h: int,
     luma: list[float] = []
     peak: list[float] = []
     while True:
+        if _cancelled(cancel):
+            proc.kill()
+            _drain_stderr(proc)
+            raise ProbeCancelled()
         buf = _read_exact(proc.stdout, frame_bytes)
         if len(buf) < frame_bytes:
             break  # clean EOF (ignore any partial trailing frame)
@@ -321,7 +338,7 @@ def _sample_video(path: str, fps: float, scale_w: int, scale_h: int,
     return times, np.asarray(luma, dtype=np.float64), np.asarray(peak, dtype=np.float64)
 
 
-def _sample_audio_rms(path: str, window: float, sr: int = 8000) -> tuple[np.ndarray, np.ndarray]:
+def _sample_audio_rms(path: str, window: float, sr: int = 8000, cancel=None) -> tuple[np.ndarray, np.ndarray]:
     """Return (times, rms dBFS) from raw mono float PCM, in `window`-sec bins."""
     win = max(1, int(sr * window))
     win_bytes = win * 4  # float32
@@ -331,6 +348,10 @@ def _sample_audio_rms(path: str, window: float, sr: int = 8000) -> tuple[np.ndar
     ])
     rms: list[float] = []
     while True:
+        if _cancelled(cancel):
+            proc.kill()
+            _drain_stderr(proc)
+            raise ProbeCancelled()
         buf = _read_exact(proc.stdout, win_bytes)
         if not buf:
             break
@@ -355,32 +376,35 @@ def probe_file(
     scale_h: int = 144,
     logo_detect: bool = True,
     hwaccel: str | None = None,
+    cancel=None,
 ) -> Signals:
     """Profile one file into brightness and loudness time series.
 
     `hwaccel` (e.g. 'cuda', 'qsv', 'd3d11va', 'auto') offloads video decoding to
-    a GPU/hardware decoder; the main video pass falls back to CPU if it fails."""
+    a GPU/hardware decoder; the main video pass falls back to CPU if it fails.
+    `cancel` is an optional threading.Event — when set mid-decode the running
+    ffmpeg is killed and ProbeCancelled is raised, so a GUI can stop promptly."""
     duration = probe_duration(path)
     logo_mask, logo_frac = (None, 0.0)
     if logo_detect:
         try:
-            logo_mask, logo_frac = _logo_mask(path, scale_w, scale_h, hwaccel=hwaccel)
-        except FfmpegNotFound:
+            logo_mask, logo_frac = _logo_mask(path, scale_w, scale_h, hwaccel=hwaccel, cancel=cancel)
+        except (FfmpegNotFound, ProbeCancelled):
             raise
         except Exception:
             logo_mask, logo_frac = None, 0.0   # never let logo detection break profiling
     try:
         v_times, v_luma, v_peak = _sample_video(
-            path, video_fps, scale_w, scale_h, logo_mask, hwaccel=hwaccel)
+            path, video_fps, scale_w, scale_h, logo_mask, hwaccel=hwaccel, cancel=cancel)
     except RuntimeError:
         if hwaccel:   # hardware decode failed -> retry on the CPU
             v_times, v_luma, v_peak = _sample_video(
-                path, video_fps, scale_w, scale_h, logo_mask, hwaccel=None)
+                path, video_fps, scale_w, scale_h, logo_mask, hwaccel=None, cancel=cancel)
         else:
             raise
     has_audio = _has_audio_stream(path)
     if has_audio:
-        a_times, a_rms = _sample_audio_rms(path, audio_window)
+        a_times, a_rms = _sample_audio_rms(path, audio_window, cancel=cancel)
     else:
         a_times, a_rms = np.empty(0), np.empty(0)
     return Signals(
