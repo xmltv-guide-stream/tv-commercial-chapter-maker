@@ -28,7 +28,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
     QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMenu,
@@ -1237,9 +1237,25 @@ class MainWindow(QMainWindow):
         super().closeEvent(e)
 
 
+def _app_icon_path():
+    """Locate the app icon: bundled next to a frozen exe (PyInstaller _MEIPASS),
+    else the repo's assets/ dir when running from source. None if not found."""
+    candidates = []
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        candidates.append(os.path.join(base, "assets", "chaptermark.ico"))
+    candidates.append(os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "assets", "chaptermark.ico"))
+    return next((c for c in candidates if os.path.isfile(c)), None)
+
+
 def launch(start_folder, cfg: DetectConfig, args) -> int:
     """Entry point used by `cli.main()` when --gui is passed."""
     app = QApplication.instance() or QApplication(sys.argv[:1])
+    icon = _app_icon_path()
+    if icon:
+        app.setWindowIcon(QIcon(icon))
     win = MainWindow(start_folder, cfg, args)
     win.show()
     return app.exec()
