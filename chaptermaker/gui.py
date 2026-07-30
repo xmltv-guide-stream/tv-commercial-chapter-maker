@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
@@ -38,7 +39,7 @@ from PySide6.QtWidgets import (
 from .chapters import MkvpropeditNotFound, embed_chapters, write_sidecars
 from .cli import VIDEO_EXTS, candidate_moments, find_videos, format_diagnosis
 from .detect import Break, DetectConfig, count_breaks, detect_to_target
-from .probe import probe_file
+from .probe import ProbeCancelled, probe_file
 from .profilecache import ProfileCache
 
 
@@ -273,13 +274,16 @@ class ProbeWorker(QThread):
         self.jobs = max(1, int(jobs))
         self.hwaccel = hwaccel
         self._stop = False
+        self._cancel = threading.Event()   # set -> running ffmpeg decodes abort
 
     def stop(self):
         self._stop = True
+        self._cancel.set()
 
     def _decode(self, path):
         sig = probe_file(path, video_fps=self.video_fps, audio_window=self.audio_window,
-                         logo_detect=self.logo_detect, hwaccel=self.hwaccel)
+                         logo_detect=self.logo_detect, hwaccel=self.hwaccel,
+                         cancel=self._cancel)
         self.cache.put(path, sig)
         return sig
 
@@ -306,18 +310,26 @@ class ProbeWorker(QThread):
         # Decode the rest concurrently. The pool workers only decode + cache;
         # signals are emitted here on the worker thread (not the pool threads).
         if needs_decode and not self._stop:
-            with ThreadPoolExecutor(max_workers=self.jobs) as ex:
-                futures = {ex.submit(self._decode, p): p for p in needs_decode}
+            ex = ThreadPoolExecutor(max_workers=self.jobs)
+            futures = {ex.submit(self._decode, p): p for p in needs_decode}
+            try:
                 for fut in as_completed(futures):
-                    path = futures[fut]
                     if self._stop:
                         break
+                    path = futures[fut]
                     done += 1
                     self.progress.emit(done, n, os.path.basename(path))
                     try:
                         self.fileReady.emit(path, fut.result(), "current")
+                    except ProbeCancelled:
+                        pass
                     except Exception as e:
                         self.failed.emit(path, str(e))
+            finally:
+                # cancel_futures drops anything not started; the cancel Event
+                # kills the few already-running ffmpeg decodes, so this returns
+                # promptly instead of waiting for full decodes to finish.
+                ex.shutdown(wait=False, cancel_futures=True)
         self.progress.emit(n, n, "")
         self.finishedAll.emit()
 
@@ -335,12 +347,18 @@ class SaveWorker(QThread):
         self.cfg = cfg
         self.embed = embed
         self.cache = cache
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
 
     def run(self):
         n = len(self.items)
         written = 0
         mkv_missing = False
         for i, (path, sig, status, override) in enumerate(self.items):
+            if self._stop:
+                break
             self.progress.emit(i, n, os.path.basename(path))
             try:
                 if override is not None:
@@ -388,6 +406,10 @@ class DiagnoseWorker(QThread):
         self.audio_window = audio_window
         self.logo_detect = logo_detect
         self.hwaccel = hwaccel
+        self._cancel = threading.Event()
+
+    def stop(self):
+        self._cancel.set()
 
     def run(self):
         try:
@@ -395,7 +417,8 @@ class DiagnoseWorker(QThread):
             if sig is None:
                 sig = probe_file(self.path, video_fps=self.video_fps,
                                  audio_window=self.audio_window,
-                                 logo_detect=self.logo_detect, hwaccel=self.hwaccel)
+                                 logo_detect=self.logo_detect, hwaccel=self.hwaccel,
+                                 cancel=self._cancel)
                 self.cache.put(self.path, sig)
             text = format_diagnosis(os.path.basename(self.path), sig, self.cfg)
             self.done.emit(self.path, text, sig)
@@ -665,11 +688,15 @@ class MainWindow(QMainWindow):
         self.reprofile_btn.clicked.connect(lambda: self._analyze(reprofile=True))
         self.save_btn = QPushButton("Save / Write")
         self.save_btn.clicked.connect(self._save)
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.clicked.connect(self._stop_all)
+        self.stop_btn.setEnabled(False)
         bar.addWidget(self.folder_label, 1)
         bar.addWidget(browse)
         bar.addWidget(self.analyze_btn)
         bar.addWidget(self.reprofile_btn)
         bar.addWidget(self.save_btn)
+        bar.addWidget(self.stop_btn)
         right.addLayout(bar)
 
         legend = QLabel("green = 00:00 intro    orange = detected break    "
@@ -991,7 +1018,16 @@ class MainWindow(QMainWindow):
     def _busy(self, on):
         for b in (self.analyze_btn, self.reprofile_btn, self.save_btn):
             b.setEnabled(not on)
+        self.stop_btn.setEnabled(on)
         self.progress.setVisible(on)
+
+    def _stop_all(self):
+        """Signal every running worker to stop. Decodes abort promptly because
+        the cancel Event kills their ffmpeg subprocess."""
+        self.status.setText("Stopping…")
+        for w in [self._worker, *self._diag_workers]:
+            if w is not None and hasattr(w, "stop"):
+                w.stop()
 
     def _start_worker(self, files, mode):
         if self._worker is not None:
@@ -1076,10 +1112,12 @@ class MainWindow(QMainWindow):
         self.status.setText(msg)
 
     def closeEvent(self, e):
-        if self._worker is not None:
-            if hasattr(self._worker, "stop"):
-                self._worker.stop()
-            self._worker.wait(3000)
+        # Stop everything and wait for the threads to unwind before closing, so
+        # no ffmpeg decode keeps running after the window is gone.
+        self._stop_all()
+        for w in [self._worker, *list(self._diag_workers)]:
+            if w is not None:
+                w.wait(5000)
         super().closeEvent(e)
 
 
