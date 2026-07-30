@@ -251,6 +251,38 @@ _LOGO_MAX_FRAC = 0.05     # if "persistent bright" exceeds this, it's not a logo
 _LOGO_MIN_KEYFRAMES = 8   # too few keyframes -> not enough evidence, skip
 _LOGO_MAX_KEYFRAMES = 1500  # cap frames held in memory for the percentile
 
+# --- recurring CORNER overlay (rating bug / brief network bug) -------------- #
+# A TV rating bug ("TV-14 D") or a brief post-break network bug isn't persistent,
+# so the logo test above misses it — but it flashes up near a fixed EDGE/corner on
+# the *fade* frames after each break. Keyframes are too sparse to catch those
+# brief fades, so this is detected during the dense video pass (_sample_video):
+# among the DARK frames, pixels in the outer EDGE band that light up in >= 2
+# distinct dark *segments* (i.e. at >= 2 breaks) are excluded from the peak.
+# Two safety valves keep false positives near-zero: (a) only the outer edge band
+# is eligible, so the central region — where real scene content lives — is never
+# masked; (b) requiring >= 2 separate dark segments means a single dark scene
+# with a bright edge won't trip it (only something recurring, i.e. an overlay).
+_LOGO_EDGE_FRAC = 0.25         # eligible band = within 25% of any edge (central 50% safe)
+_LOGO_DARK_FRAME = 24.0        # a frame whose mean is below this = a fade/near-blank
+_LOGO_RECUR_BRIGHT = 64.0      # a pixel this bright counts as "lit"
+_LOGO_RECUR_SEGMENTS = 2       # lit in >= this many distinct dark segments = overlay
+_LOGO_RECUR_MIN_PIXELS = 12    # ignore tiny/noise clusters
+_LOGO_RECUR_MAX_CANDIDATES = 4000  # cap dark bright-peak frames held for re-scoring
+
+
+def _edge_region_mask(scale_w: int, scale_h: int, frac: float) -> np.ndarray:
+    """Flat bool mask, True within `frac` of any edge (top/bottom/left/right
+    bands). The central region is left out, so scene content there is never
+    masked — that's the false-positive safety valve for overlay detection."""
+    cw = max(1, int(round(scale_w * frac)))
+    ch = max(1, int(round(scale_h * frac)))
+    m = np.zeros((scale_h, scale_w), dtype=bool)
+    m[:ch, :] = True
+    m[scale_h - ch:, :] = True
+    m[:, :cw] = True
+    m[:, scale_w - cw:] = True
+    return m.ravel()
+
 
 def _logo_mask(path: str, scale_w: int, scale_h: int, hwaccel: str | None = None, cancel=None):
     """Return (flat bool mask of overlay pixels, fraction) or (None, 0.0).
@@ -290,19 +322,22 @@ def _logo_mask(path: str, scale_w: int, scale_h: int, hwaccel: str | None = None
         _drain_stderr(proc)  # let the background reader finish (owns proc.stderr)
     if len(frames) < _LOGO_MIN_KEYFRAMES:
         return None, 0.0
-    # low percentile per pixel: bright even here => bright in >= (100-pctl)% of frames
+    # persistent overlay only: bright even at its low percentile => bright in
+    # >= (100-pctl)% of keyframes (an always-on channel logo). Transient rating
+    # bugs are handled in _sample_video from the dense pass.
     lo = np.percentile(np.stack(frames), _LOGO_PCTL, axis=0)
     thresh = max(_LOGO_MIN_LEVEL, float(np.median(lo)) + 40.0)
     mask = lo >= thresh
     frac = float(mask.mean())
     if frac <= 0.0 or frac > _LOGO_MAX_FRAC:
-        return None, 0.0   # nothing, or too big to be a logo -> ignore
+        return None, 0.0
     return mask, frac
 
 
 def _sample_video(path: str, fps: float, scale_w: int, scale_h: int,
-                  logo_mask=None, hwaccel: str | None = None, cancel=None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return (times, luma, peak), each 0..255, from raw grayscale frames at `fps`.
+                  logo_mask=None, hwaccel: str | None = None, cancel=None,
+                  detect_corner_overlay: bool = True):
+    """Return (times, luma, peak, extra_overlay_frac) from raw grayscale frames.
 
     luma = frame mean (scale-invariant, so cheap to compute at any size); peak =
     the frame's high-percentile brightness. A blank frame is dark in both; a
@@ -310,8 +345,12 @@ def _sample_video(path: str, fps: float, scale_w: int, scale_h: int,
     has a low mean but a peak that rises above the file's darkest frames, which
     is how detection avoids marking dark-scene frames as breaks.
 
-    `logo_mask` (a flat bool array of persistent-overlay pixels) is excluded from
-    the peak so a channel logo can't hold the peak up during a real fade."""
+    `logo_mask` (persistent-overlay pixels) is excluded from the peak. While
+    streaming, we also look for a RECURRING CORNER overlay (a rating bug that
+    flashes on the fades after each break): corner pixels lit across >= 2 distinct
+    dark segments are excluded from the peak of those dark frames, so a fade
+    behind a rating bug still reads blank. `extra_overlay_frac` reports how much
+    of the frame that recurring overlay covered (0.0 if none)."""
     frame_bytes = scale_w * scale_h
     keep = ~logo_mask if logo_mask is not None else None
     hw = ["-hwaccel", hwaccel] if hwaccel else []
@@ -322,6 +361,12 @@ def _sample_video(path: str, fps: float, scale_w: int, scale_h: int,
     ])
     luma: list[float] = []
     peak: list[float] = []
+    # recurring edge-overlay accumulation (segment-counted so it means ">=N breaks")
+    region = _edge_region_mask(scale_w, scale_h, _LOGO_EDGE_FRAC) if detect_corner_overlay else None
+    seg_count = np.zeros(frame_bytes, dtype=np.int32) if region is not None else None
+    seg_lit = np.zeros(frame_bytes, dtype=bool) if region is not None else None
+    in_dark = False
+    candidates: list = []   # (index, px copy) for dark frames that have a bright peak
     while True:
         if _cancelled(cancel):
             proc.kill()
@@ -331,11 +376,37 @@ def _sample_video(path: str, fps: float, scale_w: int, scale_h: int,
         if len(buf) < frame_bytes:
             break  # clean EOF (ignore any partial trailing frame)
         px = np.frombuffer(buf, dtype=np.uint8)
-        luma.append(float(px.mean()))
-        peak.append(float(np.percentile(px[keep] if keep is not None else px, _PEAK_PCT)))
+        m = float(px.mean())
+        luma.append(m)
+        pk = float(np.percentile(px[keep] if keep is not None else px, _PEAK_PCT))
+        peak.append(pk)
+        if region is not None:
+            if m < _LOGO_DARK_FRAME:
+                if not in_dark:
+                    in_dark = True
+                    seg_lit[:] = False
+                np.logical_or(seg_lit, px >= _LOGO_RECUR_BRIGHT, out=seg_lit)
+                if pk > _LOGO_RECUR_BRIGHT and len(candidates) < _LOGO_RECUR_MAX_CANDIDATES:
+                    candidates.append((len(luma) - 1, px.copy()))
+            elif in_dark:
+                in_dark = False
+                seg_count += seg_lit
     _finish(proc, produced=bool(luma), what="video")
+    if region is not None and in_dark:
+        seg_count += seg_lit
+
     times = np.arange(len(luma), dtype=np.float64) / fps
-    return times, np.asarray(luma, dtype=np.float64), np.asarray(peak, dtype=np.float64)
+    peak_arr = np.asarray(peak, dtype=np.float64)
+    extra_frac = 0.0
+    if region is not None:
+        recurring = region & (seg_count >= _LOGO_RECUR_SEGMENTS)
+        if int(np.count_nonzero(recurring)) >= _LOGO_RECUR_MIN_PIXELS:
+            extra_frac = float(recurring.mean())
+            excl = recurring | logo_mask if logo_mask is not None else recurring
+            keep2 = ~excl
+            for idx, px in candidates:      # re-score just the bug-lit dark frames
+                peak_arr[idx] = float(np.percentile(px[keep2], _PEAK_PCT))
+    return times, np.asarray(luma, dtype=np.float64), peak_arr, extra_frac
 
 
 def _sample_audio_rms(path: str, window: float, sr: int = 8000, cancel=None) -> tuple[np.ndarray, np.ndarray]:
@@ -394,14 +465,15 @@ def probe_file(
         except Exception:
             logo_mask, logo_frac = None, 0.0   # never let logo detection break profiling
     try:
-        v_times, v_luma, v_peak = _sample_video(
+        v_times, v_luma, v_peak, recur_frac = _sample_video(
             path, video_fps, scale_w, scale_h, logo_mask, hwaccel=hwaccel, cancel=cancel)
     except RuntimeError:
         if hwaccel:   # hardware decode failed -> retry on the CPU
-            v_times, v_luma, v_peak = _sample_video(
+            v_times, v_luma, v_peak, recur_frac = _sample_video(
                 path, video_fps, scale_w, scale_h, logo_mask, hwaccel=None, cancel=cancel)
         else:
             raise
+    logo_frac = float(min(1.0, logo_frac + recur_frac))   # persistent + recurring-corner
     has_audio = _has_audio_stream(path)
     if has_audio:
         a_times, a_rms = _sample_audio_rms(path, audio_window, cancel=cancel)
