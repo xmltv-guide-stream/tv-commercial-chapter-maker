@@ -177,12 +177,13 @@ def build_profile(sig: Signals, cfg: DetectConfig) -> Profile:
     peak_floor, peak_thresh = float("nan"), None
     if cfg.blank_guard and getattr(sig, "v_peak", None) is not None and sig.v_peak.size:
         peak_floor = _sustained_floor(sig.v_peak, sig.v_times, _FLOOR_SUSTAIN)
-        # Clamp to an absolute ceiling: the adaptive part alone would drift up on
-        # a file with no true-dark frames (high darkest-peak floor) — and inflate
-        # under --min-chapters escalation — until bright scenes slip through. The
-        # cap means a frame with a genuinely bright region is never "blank", and
-        # if even the darkest frame's peak sits above the cap, nothing qualifies.
-        peak_thresh = min(peak_floor + cfg.bright_margin * cfg.sensitivity, cfg.peak_cap)
+        # NOT scaled by sensitivity: the blank guard is a "is there real bright
+        # content here" filter, not a darkness threshold, so raising --sensitivity
+        # (or --min-chapters escalation looping it up) must NOT loosen it —
+        # otherwise escalation eventually lets a bright bumper/content frame slip
+        # through and fabricates a break. Clamped to an absolute ceiling so a file
+        # with no true-dark frames (high darkest-peak floor) yields no dark breaks.
+        peak_thresh = min(peak_floor + cfg.bright_margin, cfg.peak_cap)
 
     return Profile(
         luma_floor=luma_floor,
