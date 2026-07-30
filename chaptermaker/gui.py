@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
 from .chapters import MkvpropeditNotFound, embed_chapters, write_sidecars
 from .cli import VIDEO_EXTS, candidate_moments, find_videos, format_diagnosis
 from .detect import Break, DetectConfig, count_breaks, detect_to_target
-from .probe import ProbeCancelled, probe_file
+from .probe import ProbeCancelled, probe_file, read_chapters
 from .profilecache import ProfileCache
 
 
@@ -161,6 +161,7 @@ class TimelineView(QWidget):
         super().__init__(parent)
         self.duration = 0.0
         self.marks: list[tuple[float, bool]] | None = None
+        self.existing: list[float] = []
         self.stale = False
         self.manual = False
         self.placeholder = "not analyzed"
@@ -168,17 +169,22 @@ class TimelineView(QWidget):
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.setMouseTracking(True)
 
-    def set_not_analyzed(self):
-        self.duration = 0.0
+    def set_not_analyzed(self, existing=None, duration=0.0):
+        # marks=None means "not analyzed"; existing chapters (if any) still draw,
+        # positioned by the file's own duration from the ffprobe scan.
+        self.duration = float(duration or 0.0)
         self.marks = None
+        self.existing = list(existing or [])
         self.stale = False
         self.manual = False
-        self.setToolTip("")
+        self.setToolTip("Existing chapters in the file (not analyzed yet)"
+                        if self.existing else "")
         self.update()
 
-    def set_data(self, duration, marks, stale=False, manual=False):
+    def set_data(self, duration, marks, stale=False, manual=False, existing=None):
         self.duration = float(duration or 0.0)
         self.marks = list(marks)
+        self.existing = list(existing or [])
         self.stale = stale
         self.manual = manual
         if manual:
@@ -187,6 +193,8 @@ class TimelineView(QWidget):
         elif stale:
             self.setToolTip("Preview from an OUTDATED profile — click Analyze to "
                             "refresh (blank-guard/peak features are off until you do)")
+        elif self.existing:
+            self.setToolTip("Magenta = chapters already in the file")
         else:
             self.setToolTip("")
         self.update()
@@ -199,7 +207,8 @@ class TimelineView(QWidget):
         p.setBrush(QColor(28, 30, 34))
         p.drawRoundedRect(r, 4, 4)
 
-        if self.duration <= 0 or self.marks is None:
+        # Nothing to position against at all -> "not analyzed" placeholder.
+        if self.duration <= 0:
             p.setPen(QColor(120, 122, 128))
             p.drawText(r, Qt.AlignCenter, self.placeholder)
             return
@@ -211,6 +220,20 @@ class TimelineView(QWidget):
             x = x0 + w * (t / self.duration)
             p.drawLine(int(x), y0 + 3, int(x), y0 + h - 3)
             t += 300.0
+
+        # Existing (already-in-the-file) chapters: magenta, drawn as shorter ticks
+        # up top so they read distinctly from the detected/override marks below.
+        for tm in self.existing:
+            x = x0 + w * (tm / max(self.duration, 1e-9))
+            p.setPen(QPen(QColor(210, 120, 220), 2))
+            p.drawLine(int(x), y0 + 1, int(x), y0 + int(h * 0.45))
+
+        if self.marks is None:
+            # not analyzed, but we drew the bar + any existing chapters
+            p.setPen(QColor(120, 122, 128))
+            p.drawText(r.adjusted(0, 0, -4, 0), Qt.AlignRight | Qt.AlignVCenter,
+                       "existing (not analyzed)" if self.existing else "not analyzed")
+            return
 
         # Manual overrides in cyan; stale previews muted; normal auto is orange.
         if self.manual:
@@ -426,6 +449,33 @@ class DiagnoseWorker(QThread):
             self.failed.emit(self.path, str(e))
 
 
+class ExistingChaptersWorker(QThread):
+    """Reads chapters already embedded in each file (ffprobe, no decode) so they
+    can be shown before any analyze."""
+
+    ready = Signal(str, object, float)   # path, list[float] times, duration
+    finishedAll = Signal()
+
+    def __init__(self, paths):
+        super().__init__()
+        self.paths = list(paths)
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        for path in self.paths:
+            if self._stop:
+                break
+            try:
+                times, dur = read_chapters(path)
+            except Exception:
+                times, dur = [], 0.0
+            self.ready.emit(path, times, dur)
+        self.finishedAll.emit()
+
+
 class DiagnoseDialog(QDialog):
     """A non-modal window showing a diagnose report in monospace, with a button
     to copy the whole thing."""
@@ -467,13 +517,14 @@ class OverrideDialog(QDialog):
     chosen by detection are pre-checked; the user can tick/untick any, or add a
     custom timestamp. Detection settings are never touched."""
 
-    def __init__(self, title, rows, checked_times, parent=None):
+    def __init__(self, title, rows, checked_times, existing=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Override chapters — {title}")
         self.resize(560, 640)
         self.result_times = None   # list on Apply
         self.cleared = False       # True if "use auto" chosen
         self._boxes: list[tuple[QCheckBox, float]] = []
+        existing = list(existing or [])
 
         lay = QVBoxLayout(self)
         lay.addWidget(QLabel(
@@ -484,11 +535,19 @@ class OverrideDialog(QDialog):
         self._list = QVBoxLayout(cont)
         self._list.setSpacing(2)
         for r in rows:
-            self._add_box(r["time"], self._fmt_row(r),
-                          checked=any(abs(r["time"] - ct) < 1.0 for ct in checked_times))
-        # any pre-checked times not present as candidate rows (e.g. an odd auto
-        # break) still need a row so they stay checked
+            t = r["time"]
+            label = self._fmt_row(r)
+            if any(abs(t - e) < 1.0 for e in existing):
+                label += "  (in file)"
+            self._add_box(t, label, checked=any(abs(t - ct) < 1.0 for ct in checked_times))
         shown = {t for _, t in self._boxes}
+        # existing chapters not already listed as candidates
+        for e in existing:
+            if not any(abs(e - s) < 1.0 for s in shown):
+                self._add_box(e, f"{_hms(e)}   (existing in file)",
+                              checked=any(abs(e - ct) < 1.0 for ct in checked_times))
+                shown.add(e)
+        # any other pre-checked times not present as rows (e.g. an odd auto break)
         for ct in sorted(checked_times):
             if not any(abs(ct - s) < 1.0 for s in shown):
                 self._add_box(ct, f"{_hms(ct)}   (current chapter)", checked=True)
@@ -585,12 +644,15 @@ class MainWindow(QMainWindow):
         self.signals: dict[str, object] = {}   # path -> Signals | None
         self.file_status: dict[str, str] = {}  # path -> missing|current|stale
         self.overrides: dict[str, list] = {}   # path -> hand-picked chapter times
+        self.existing: dict[str, list] = {}    # path -> chapters already in the file
+        self.existing_dur: dict[str, float] = {}  # path -> file duration (ffprobe)
         self.rows: dict[str, dict] = {}         # path -> {name,count,timeline}
         self.floats: dict[str, FloatControl] = {}
         self.checks: dict[str, QCheckBox] = {}
         self.combos: dict[str, QComboBox] = {}
         self._worker: QThread | None = None
         self._diag_workers: list[QThread] = []
+        self._existing_worker: QThread | None = None
         self._dialogs: list[QDialog] = []
         self._sampling_dirty = False
 
@@ -700,6 +762,7 @@ class MainWindow(QMainWindow):
         right.addLayout(bar)
 
         legend = QLabel("green = 00:00 intro    orange = detected break    "
+                        "cyan = manual    magenta = existing in file    "
                         "gridlines every 5 min")
         legend.setStyleSheet("color:#888; padding:2px 0;")
         right.addWidget(legend)
@@ -836,11 +899,33 @@ class MainWindow(QMainWindow):
         self._build_rows(files)
         self.signals = {p: None for p in files}
         self.file_status = {p: "missing" for p in files}
+        self.existing = {}
+        self.existing_dur = {}
         if not files:
             self.status.setText("No video files found in this folder.")
             return
         # read existing cache only (no decoding) so timelines draw immediately
         self._start_worker(files, mode="cache")
+        # scan for chapters already embedded in the files (fast, no decode)
+        self._start_existing_scan(files)
+
+    def _start_existing_scan(self, files):
+        if self._existing_worker is not None:
+            self._existing_worker.stop()
+            self._existing_worker.wait(2000)
+        w = ExistingChaptersWorker(files)
+        self._existing_worker = w
+        w.ready.connect(self._on_existing)
+        w.finishedAll.connect(
+            lambda w=w: setattr(self, "_existing_worker", None)
+            if self._existing_worker is w else None)
+        w.start()
+
+    def _on_existing(self, path, times, duration):
+        self.existing[path] = list(times)
+        if duration:
+            self.existing_dur[path] = float(duration)
+        self._update_row(path, self.signals.get(path))
 
     def _build_rows(self, files):
         # clear existing rows (keep the trailing stretch)
@@ -895,11 +980,12 @@ class MainWindow(QMainWindow):
         if row is None:
             return
         cfg = cfg or self._cfg()
+        existing = self.existing.get(path) or []
         # manual override wins over both auto detection and stale styling
         if path in self.overrides and sig is not None:
             breaks = _manual_breaks(self.overrides[path], cfg)
             row["timeline"].set_data(sig.duration, [(b.time, b.is_intro) for b in breaks],
-                                     manual=True)
+                                     manual=True, existing=existing)
             row["count"].setText(str(sum(1 for b in breaks if not b.is_intro)))
             row["name"].setStyleSheet("color:#6db3d6;")
             return
@@ -907,18 +993,20 @@ class MainWindow(QMainWindow):
         # amber filename for outdated profiles, plain otherwise
         row["name"].setStyleSheet("color:#d2aa5a;" if stale else "")
         if sig is None:
-            row["timeline"].set_not_analyzed()
-            row["count"].setText("–")
+            # not analyzed — but still show any existing chapters (positioned by
+            # the file's own duration from the ffprobe scan)
+            dur = self.existing_dur.get(path, 0.0)
+            row["timeline"].set_not_analyzed(existing=existing, duration=dur)
+            row["count"].setText(f"({len(existing)})" if existing else "–")
             return
-        cfg = cfg or self._cfg()
         try:
             breaks, _, _ = detect_to_target(sig, cfg)
         except Exception as e:
             row["timeline"].placeholder = f"error: {e}"[:60]
-            row["timeline"].set_not_analyzed()
+            row["timeline"].set_not_analyzed(existing=existing, duration=sig.duration)
             return
         marks = [(b.time, b.is_intro) for b in breaks]
-        row["timeline"].set_data(sig.duration, marks, stale=stale)
+        row["timeline"].set_data(sig.duration, marks, stale=stale, existing=existing)
         row["count"].setText(str(count_breaks(breaks)))
 
     def _update_status(self):
@@ -964,12 +1052,15 @@ class MainWindow(QMainWindow):
             return
         cfg = self._cfg()
         rows = candidate_moments(sig, cfg)
+        existing = self.existing.get(path) or []
         if path in self.overrides:
             checked = set(self.overrides[path])
+        elif existing:
+            checked = set(existing)      # preserve the file's existing chapters by default
         else:
             breaks, _, _ = detect_to_target(sig, cfg)
             checked = {b.time for b in breaks if not b.is_intro}
-        dlg = OverrideDialog(os.path.basename(path), rows, checked, self)
+        dlg = OverrideDialog(os.path.basename(path), rows, checked, existing, self)
         if dlg.exec() == QDialog.Accepted:
             if dlg.cleared:
                 self.overrides.pop(path, None)
@@ -1110,12 +1201,18 @@ class MainWindow(QMainWindow):
         if mkv_missing:
             msg += "  (mkvpropedit not found — sidecars written, MKVs not embedded)"
         self.status.setText(msg)
+        # embedding changed the files' chapters — re-scan so the "existing" marks
+        # reflect what was just written
+        if self.rows:
+            self._start_existing_scan(list(self.rows.keys()))
 
     def closeEvent(self, e):
         # Stop everything and wait for the threads to unwind before closing, so
         # no ffmpeg decode keeps running after the window is gone.
         self._stop_all()
-        for w in [self._worker, *list(self._diag_workers)]:
+        if self._existing_worker is not None:
+            self._existing_worker.stop()
+        for w in [self._worker, self._existing_worker, *list(self._diag_workers)]:
             if w is not None:
                 w.wait(5000)
         super().closeEvent(e)
