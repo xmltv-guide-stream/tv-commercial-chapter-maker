@@ -36,7 +36,11 @@ CACHE_DIRNAME = ".chapterprofiles"
 #      (keyframe-only was too sparse to catch brief fade bugs)
 #   8: overlay-eligible region widened from tight corner boxes to a 25% edge band
 #      (rating bugs are often inset from the exact corner)
-SIGNALS_VERSION = 8
+#   9: dilate the detected overlay + lower the "lit" threshold, to cover a bug
+#      that's brighter/bigger on one frame than its recurring core
+#  10: per-frame overlay exclusion also sweeps the dim anti-aliased halo (exclude
+#      everything above the dark-frame level inside the overlay neighborhood)
+SIGNALS_VERSION = 10
 
 
 def _key(path: str) -> str:

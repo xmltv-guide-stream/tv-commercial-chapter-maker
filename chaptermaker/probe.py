@@ -264,10 +264,34 @@ _LOGO_MAX_KEYFRAMES = 1500  # cap frames held in memory for the percentile
 # with a bright edge won't trip it (only something recurring, i.e. an overlay).
 _LOGO_EDGE_FRAC = 0.25         # eligible band = within 25% of any edge (central 50% safe)
 _LOGO_DARK_FRAME = 24.0        # a frame whose mean is below this = a fade/near-blank
-_LOGO_RECUR_BRIGHT = 64.0      # a pixel this bright counts as "lit"
+_LOGO_RECUR_BRIGHT = 48.0      # a pixel this bright counts as "lit"
 _LOGO_RECUR_SEGMENTS = 2       # lit in >= this many distinct dark segments = overlay
 _LOGO_RECUR_MIN_PIXELS = 12    # ignore tiny/noise clusters
+_LOGO_RECUR_DILATE = 14        # neighborhood grown around the proven overlay core;
+                               # per dark frame we exclude the bug's ACTUAL bright
+                               # pixels within it, so it adapts to the bug's size
+                               # on a frame where it's brighter/bigger than its core
 _LOGO_RECUR_MAX_CANDIDATES = 4000  # cap dark bright-peak frames held for re-scoring
+
+
+def _dilate_flat(mask_flat: np.ndarray, scale_w: int, scale_h: int, r: int) -> np.ndarray:
+    """Grow a flat bool mask by `r` pixels (8-connected box, no wrap-around), so
+    a rectangular overlay/halo is covered to its corners, not just a diamond."""
+    if r <= 0:
+        return mask_flat
+    out = mask_flat.reshape(scale_h, scale_w).copy()
+    for _ in range(int(r)):
+        d = out.copy()
+        d[1:, :] |= out[:-1, :]
+        d[:-1, :] |= out[1:, :]
+        d[:, 1:] |= out[:, :-1]
+        d[:, :-1] |= out[:, 1:]
+        d[1:, 1:] |= out[:-1, :-1]
+        d[1:, :-1] |= out[:-1, 1:]
+        d[:-1, 1:] |= out[1:, :-1]
+        d[:-1, :-1] |= out[1:, 1:]
+        out = d
+    return out.ravel()
 
 
 def _edge_region_mask(scale_w: int, scale_h: int, frac: float) -> np.ndarray:
@@ -386,7 +410,7 @@ def _sample_video(path: str, fps: float, scale_w: int, scale_h: int,
                     in_dark = True
                     seg_lit[:] = False
                 np.logical_or(seg_lit, px >= _LOGO_RECUR_BRIGHT, out=seg_lit)
-                if pk > _LOGO_RECUR_BRIGHT and len(candidates) < _LOGO_RECUR_MAX_CANDIDATES:
+                if pk > _LOGO_DARK_FRAME and len(candidates) < _LOGO_RECUR_MAX_CANDIDATES:
                     candidates.append((len(luma) - 1, px.copy()))
             elif in_dark:
                 in_dark = False
@@ -399,13 +423,21 @@ def _sample_video(path: str, fps: float, scale_w: int, scale_h: int,
     peak_arr = np.asarray(peak, dtype=np.float64)
     extra_frac = 0.0
     if region is not None:
-        recurring = region & (seg_count >= _LOGO_RECUR_SEGMENTS)
-        if int(np.count_nonzero(recurring)) >= _LOGO_RECUR_MIN_PIXELS:
-            extra_frac = float(recurring.mean())
-            excl = recurring | logo_mask if logo_mask is not None else recurring
-            keep2 = ~excl
-            for idx, px in candidates:      # re-score just the bug-lit dark frames
-                peak_arr[idx] = float(np.percentile(px[keep2], _PEAK_PCT))
+        core = region & (seg_count >= _LOGO_RECUR_SEGMENTS)   # proven recurring overlay
+        if int(np.count_nonzero(core)) >= _LOGO_RECUR_MIN_PIXELS:
+            # a generous neighborhood around the core (still clipped to the edge
+            # band, never the protected centre). Per dark frame we exclude only
+            # the bright pixels inside it, so the bug's per-frame extent is
+            # covered without excluding the black background or distant content.
+            hood = _dilate_flat(core, scale_w, scale_h, _LOGO_RECUR_DILATE) & region
+            extra_frac = float(core.mean())
+            for idx, px in candidates:
+                # on a dark frame, anything above the dark-frame level inside the
+                # proven overlay neighborhood IS the overlay (core + dim halo);
+                # true-black background stays, so the peak reflects real content.
+                bug = hood & (px >= _LOGO_DARK_FRAME)
+                excl = bug | logo_mask if logo_mask is not None else bug
+                peak_arr[idx] = float(np.percentile(px[~excl], _PEAK_PCT))
     return times, np.asarray(luma, dtype=np.float64), peak_arr, extra_frac
 
 
