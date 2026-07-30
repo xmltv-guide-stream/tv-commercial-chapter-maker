@@ -134,7 +134,10 @@ def format_diagnosis(rel: str, sig, cfg: DetectConfig) -> str:
 
     p(f"=== DIAGNOSE: {rel} ===")
     p(f"duration={_fmt_clock(duration)}  mode={cfg.mode}  sensitivity={cfg.sensitivity}  "
-      f"min_duration={cfg.min_duration}s  min_gap={cfg.min_gap}s  skip_start={cfg.skip_start}s")
+      f"min_duration={cfg.min_duration}s  min_gap={cfg.min_gap}s")
+    p(f"skip_start={cfg.skip_start}s  skip_end={cfg.skip_end}s  "
+      f"min_chapters={cfg.min_chapters}  blank_guard={'on' if cfg.blank_guard else 'off'}  "
+      f"ignore_audio={cfg.ignore_audio}")
 
     # --- video ---
     L = sig.v_luma
@@ -243,9 +246,26 @@ def format_diagnosis(rel: str, sig, cfg: DetectConfig) -> str:
             break
 
     # --- interpretation hint ---
-    breaks, _, _ = detect_to_target(sig, cfg)
+    breaks, _, trace = detect_to_target(sig, cfg)
     p("")
     p(f"With current settings -> {count_breaks(breaks)} breaks detected.")
+    # List what detection ACTUALLY produced. This can differ from the darkest-
+    # moments table above, which is computed at the base sensitivity — whereas
+    # --min-chapters escalation may have loosened thresholds to reach its target.
+    if breaks:
+        times = ", ".join("00:00 (intro)" if b.is_intro else _fmt_clock(b.time) for b in breaks)
+        p(f"  chapters: {times}")
+    if any(t.get("kind") == "fallback" for t in trace):
+        p("  note: audio was the limiter -> fell back to video-only.")
+    esc = [t for t in trace if t.get("kind") == "escalate"]
+    if esc:
+        last = esc[-1]
+        got = count_breaks(breaks)
+        verb = "reached" if got >= cfg.min_chapters else f"could NOT reach (only {got})"
+        p(f"  note: escalated, {verb} --min-chapters={cfg.min_chapters} "
+          f"(sensitivity {last['sensitivity']}, min-duration {last['min_duration']}s, "
+          f"{len(esc)} rounds). The darkest-moments table above uses BASE sensitivity, "
+          f"so it may not match the chapters listed here.")
     if cfg.mode == "and" and black_ok and quiet_ok:
         dark_not_quiet = np.count_nonzero(black_mask & ~quiet_mask)
         if dark_not_quiet > np.count_nonzero(black_mask & quiet_mask):
