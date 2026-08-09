@@ -149,6 +149,47 @@ def probe_duration(path: str) -> float:
         return 0.0
 
 
+def _read_all(stream) -> bytes:
+    parts = []
+    while True:
+        chunk = stream.read(65536)
+        if not chunk:
+            break
+        parts.append(chunk)
+    return b"".join(parts)
+
+
+def extract_frame(path: str, t: float, max_w: int | None = None,
+                  hwaccel: str | None = None) -> bytes | None:
+    """Grab a single frame at time `t` (seconds) as JPEG bytes, or None on error.
+    `max_w` scales the frame down to at most that width (keeping aspect); None =
+    native resolution. Uses a fast seek to just before `t` then an accurate seek
+    the rest of the way, so it's quick without landing on the wrong keyframe."""
+    t = max(0.0, float(t))
+    pre = max(0.0, t - 3.0)
+    fine = t - pre
+    hw = ["-hwaccel", hwaccel] if hwaccel else []
+    args = [*hw, "-ss", f"{pre:.3f}", "-i", path, "-ss", f"{fine:.3f}",
+            "-frames:v", "1", "-an", "-sn", "-dn"]
+    if max_w:
+        args += ["-vf", f"scale='min({int(max_w)},iw)':-2"]
+    args += ["-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", "3", "-"]
+    try:
+        proc = _popen(args)
+    except FfmpegNotFound:
+        return None
+    try:
+        data = _read_all(proc.stdout)
+    except Exception:
+        data = b""
+    _drain_stderr(proc)
+    try:
+        proc.wait()
+    except Exception:
+        pass
+    return data or None
+
+
 def read_chapters(path: str) -> tuple[list[float], float]:
     """Return (existing chapter start times in seconds, file duration in seconds)
     from ffprobe — fast metadata read, no decoding. ([], 0.0) if none/on error."""

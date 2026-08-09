@@ -28,7 +28,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen
+from PySide6.QtGui import QColor, QFont, QIcon, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
     QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMenu,
@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
 from .chapters import MkvpropeditNotFound, embed_chapters, write_sidecars
 from .cli import VIDEO_EXTS, candidate_moments, find_videos, format_diagnosis
 from .detect import Break, DetectConfig, count_breaks, detect_to_target
-from .probe import ProbeCancelled, probe_file, read_chapters
+from .probe import ProbeCancelled, extract_frame, probe_file, read_chapters
 from .profilecache import ProfileCache
 
 
@@ -512,24 +512,104 @@ class DiagnoseDialog(QDialog):
         self._copied.setText("copied to clipboard")
 
 
+class ClickableLabel(QLabel):
+    """A QLabel that emits `clicked` when pressed (used for frame previews)."""
+
+    clicked = Signal()
+
+    def mousePressEvent(self, ev):   # noqa: N802 (Qt override)
+        self.clicked.emit()
+        super().mousePressEvent(ev)
+
+
+class FramePreviewWorker(QThread):
+    """Extract video frames off the GUI thread. Emits (index, jpeg-bytes-or-None)
+    for each requested (index, time) as it completes, so thumbnails fill in
+    progressively without blocking the dialog."""
+
+    thumb = Signal(int, object)
+
+    def __init__(self, path, items, width, hwaccel=None, jobs=4, parent=None):
+        super().__init__(parent)
+        self.path = path
+        self.items = list(items)          # [(index, time_seconds), ...]
+        self.width = width                # None = native resolution
+        self.hwaccel = hwaccel
+        self.jobs = max(1, int(jobs))
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        if not self.items:
+            return
+        with ThreadPoolExecutor(max_workers=min(self.jobs, len(self.items))) as ex:
+            futs = {ex.submit(extract_frame, self.path, t, self.width, self.hwaccel): idx
+                    for idx, t in self.items}
+            for fut in as_completed(futs):
+                if self._stop:
+                    break
+                idx = futs[fut]
+                try:
+                    data = fut.result()
+                except Exception:
+                    data = None
+                if not self._stop:
+                    self.thumb.emit(idx, data)
+
+
+class PopoutDialog(QDialog):
+    """A borderless full-resolution frame. Click anywhere on it to close."""
+
+    def __init__(self, pixmap, caption, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(caption)
+        screen = QApplication.primaryScreen().availableGeometry()
+        maxw, maxh = int(screen.width() * 0.92), int(screen.height() * 0.9)
+        pm = pixmap
+        if pm.width() > maxw or pm.height() > maxh:
+            pm = pm.scaled(maxw, maxh, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lbl = ClickableLabel()
+        lbl.setPixmap(pm)
+        lbl.setCursor(Qt.PointingHandCursor)
+        lbl.setToolTip("Click to close")
+        lbl.clicked.connect(self.accept)
+        lay.addWidget(lbl)
+
+
 class OverrideDialog(QDialog):
     """Hand-pick a file's chapters from its candidate moments. The rows already
     chosen by detection are pre-checked; the user can tick/untick any, or add a
-    custom timestamp. Detection settings are never touched."""
+    custom timestamp. Detection settings are never touched.
 
-    def __init__(self, title, rows, checked_times, existing=None, parent=None):
+    Each row shows a thumbnail of the frame at that timestamp; click it for a
+    full-resolution pop-out (click the pop-out to dismiss it)."""
+
+    THUMB_W = 160
+    THUMB_H = 90
+
+    def __init__(self, title, rows, checked_times, existing=None,
+                 video_path=None, hwaccel=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Override chapters — {title}")
-        self.resize(560, 640)
+        self.resize(720, 660)
         self.result_times = None   # list on Apply
         self.cleared = False       # True if "use auto" chosen
-        self._boxes: list[tuple[QCheckBox, float]] = []
+        self.video_path = video_path
+        self.hwaccel = hwaccel
+        # each row: {"cb": QCheckBox, "t": float, "thumb": ClickableLabel}
+        self._rows: list[dict] = []
+        self._workers: list[FramePreviewWorker] = []
+        self._popout_pending = False
         existing = list(existing or [])
 
         lay = QVBoxLayout(self)
         lay.addWidget(QLabel(
             "Tick the timestamps to use as this file's chapters.\n"
-            "Detection settings are unchanged — this overrides only this file."))
+            "Click a preview frame to enlarge it. Detection settings are unchanged."))
 
         cont = QWidget()
         self._list = QVBoxLayout(cont)
@@ -540,7 +620,7 @@ class OverrideDialog(QDialog):
             if any(abs(t - e) < 1.0 for e in existing):
                 label += "  (in file)"
             self._add_box(t, label, checked=any(abs(t - ct) < 1.0 for ct in checked_times))
-        shown = {t for _, t in self._boxes}
+        shown = {row["t"] for row in self._rows}
         # existing chapters not already listed as candidates
         for e in existing:
             if not any(abs(e - s) < 1.0 for s in shown):
@@ -595,34 +675,136 @@ class OverrideDialog(QDialog):
         tagtxt = f"   [{', '.join(tags)}]" if tags else ""
         return f"{_hms(r['time']):>8}   luma={r['luma']:.0f}{peak}{rms}{tagtxt}"
 
+    def _thumb_placeholder(self):
+        thumb = ClickableLabel()
+        thumb.setFixedSize(self.THUMB_W, self.THUMB_H)
+        thumb.setAlignment(Qt.AlignCenter)
+        thumb.setText("…")
+        thumb.setStyleSheet(
+            "background:#111; border:1px solid #333; color:#666;")
+        thumb.setCursor(Qt.PointingHandCursor)
+        thumb.setToolTip("Click to enlarge")
+        return thumb
+
     def _add_box(self, t, label, checked):
+        t = float(t)
+        idx = len(self._rows)
+        row = QWidget()
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(8)
+        thumb = self._thumb_placeholder()
+        thumb.clicked.connect(lambda t=t: self._popout(t))
         cb = QCheckBox(label)
         cb.setChecked(checked)
+        rl.addWidget(thumb)
+        rl.addWidget(cb, 1)
+
         n = self._list.count()
         if n > 0 and self._list.itemAt(n - 1).spacerItem() is not None:
-            self._list.insertWidget(n - 1, cb)   # keep trailing stretch last
+            self._list.insertWidget(n - 1, row)   # keep trailing stretch last
         else:
-            self._list.addWidget(cb)
-        self._boxes.append((cb, float(t)))
+            self._list.addWidget(row)
+        self._rows.append({"cb": cb, "t": t, "thumb": thumb})
+        return idx
+
+    def showEvent(self, ev):   # noqa: N802 (Qt override)
+        super().showEvent(ev)
+        # Kick off thumbnail extraction once, after the dialog is visible.
+        if getattr(self, "_thumbs_started", False):
+            return
+        self._thumbs_started = True
+        if not self.video_path:
+            for row in self._rows:
+                row["thumb"].setText("no preview")
+            return
+        items = [(i, r["t"]) for i, r in enumerate(self._rows)]
+        self._start_thumb_worker(items)
+
+    def _start_thumb_worker(self, items):
+        if not items or not self.video_path:
+            return
+        w = FramePreviewWorker(self.video_path, items, self.THUMB_W * 2,
+                               self.hwaccel, jobs=4, parent=self)
+        w.thumb.connect(self._on_thumb)
+        self._workers.append(w)
+        w.start()
+
+    def _on_thumb(self, idx, data):
+        if not (0 <= idx < len(self._rows)):
+            return
+        thumb = self._rows[idx]["thumb"]
+        if not data:
+            thumb.setText("no frame")
+            return
+        img = QImage.fromData(data)
+        if img.isNull():
+            thumb.setText("no frame")
+            return
+        pm = QPixmap.fromImage(img).scaled(
+            self.THUMB_W, self.THUMB_H, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        thumb.setText("")
+        thumb.setPixmap(pm)
+
+    def _popout(self, t):
+        if not self.video_path:
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        self._popout_pending = True
+        w = FramePreviewWorker(self.video_path, [(0, t)], None,
+                               self.hwaccel, jobs=1, parent=self)
+        w.thumb.connect(lambda idx, data, t=t: self._show_popout(data, t))
+        self._workers.append(w)
+        w.start()
+
+    def _show_popout(self, data, t):
+        if self._popout_pending:
+            QApplication.restoreOverrideCursor()
+            self._popout_pending = False
+        if not data:
+            return
+        img = QImage.fromData(data)
+        if img.isNull():
+            return
+        dlg = PopoutDialog(QPixmap.fromImage(img), f"Frame @ {_hms(t)}", self)
+        dlg.exec()
 
     def _add_custom(self):
         t = _parse_time(self.custom.text())
         if t is None:
             return
-        if any(abs(t - bt) < 1.0 for _, bt in self._boxes):
+        if any(abs(t - r["t"]) < 1.0 for r in self._rows):
             self.custom.clear()
             return
-        self._add_box(t, f"{_hms(t)}   (custom)", checked=True)
+        idx = self._add_box(t, f"{_hms(t)}   (custom)", checked=True)
         self.custom.clear()
+        self._start_thumb_worker([(idx, float(t))])
 
     def _apply(self):
-        self.result_times = sorted(t for cb, t in self._boxes if cb.isChecked())
+        self.result_times = sorted(r["t"] for r in self._rows if r["cb"].isChecked())
+        self._stop_workers()
         self.accept()
 
     def _clear(self):
         self.cleared = True
         self.result_times = []
+        self._stop_workers()
         self.accept()
+
+    def _stop_workers(self):
+        if self._popout_pending:
+            QApplication.restoreOverrideCursor()
+            self._popout_pending = False
+        for w in self._workers:
+            w.stop()
+
+    def reject(self):   # noqa: N802 (Qt override)
+        self._stop_workers()
+        super().reject()
+
+    def closeEvent(self, ev):   # noqa: N802 (Qt override)
+        self._stop_workers()
+        super().closeEvent(ev)
 
 
 # --------------------------------------------------------------------------- #
@@ -1060,7 +1242,10 @@ class MainWindow(QMainWindow):
         else:
             breaks, _, _ = detect_to_target(sig, cfg)
             checked = {b.time for b in breaks if not b.is_intro}
-        dlg = OverrideDialog(os.path.basename(path), rows, checked, existing, self)
+        hw = self.combos["hwaccel"].currentText()
+        dlg = OverrideDialog(os.path.basename(path), rows, checked, existing,
+                             video_path=path,
+                             hwaccel=(None if hw == "none" else hw), parent=self)
         if dlg.exec() == QDialog.Accepted:
             if dlg.cleared:
                 self.overrides.pop(path, None)
