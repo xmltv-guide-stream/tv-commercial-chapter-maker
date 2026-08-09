@@ -4,12 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chaptermaker"
-version = "0.1.5"
+version = "0.1.6"
 description = "Adaptively insert chapter markers at likely commercial breaks in video files (built for messy VHS/DVR rips)."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
-***REMOVED***
 keywords = ["video", "chapters", "mkv", "ffmpeg", "commercial-detection", "vhs", "dvr"]
 classifiers = [
     "Programming Language :: Python :: 3",
