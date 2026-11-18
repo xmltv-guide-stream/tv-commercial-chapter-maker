@@ -21,12 +21,15 @@ from .probe import find_tool
 
 
 def _fmt_ts(seconds: float) -> str:
-    if seconds < 0:
-        seconds = 0.0
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = seconds % 60
-    return f"{h:02d}:{m:02d}:{s:09.6f}"
+    """HH:MM:SS.mmm — the OGM chapter spec mandates exactly 3 fractional digits
+    (stricter parsers such as ErsatzTV reject more), and Matroska XML accepts
+    it too. Rounding to integer ms first also avoids float carry producing an
+    invalid "SS" of 60 (e.g. 59.9999997 -> "60.000000")."""
+    total_ms = max(0, round(seconds * 1000))
+    h, rem = divmod(total_ms, 3_600_000)
+    m, rem = divmod(rem, 60_000)
+    s, ms = divmod(rem, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
 
 
 def chapter_titles(breaks: list[Break]) -> list[str]:
